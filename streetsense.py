@@ -277,18 +277,6 @@ class Microphone():
         numwrite = 0
         samples = bytearray(NUM_BYTES_IN_SAMPLE_BLOCK)
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
-        end = utime.ticks_us()
-
-        loop_count = 0
-        
-        sum_yield_delay = 0
-        max_yield_delay = 0
-        
-        sum_loop_time = 0
-        max_loop_time = 0
-        
-        sum_sdcard_write_time = 0
-        max_sdcard_write_time = 0
 
         for _ in range(NUM_SAMPLE_BYTES_IN_WAV // NUM_BYTES_IN_SDCARD_SECTOR):
             try:
