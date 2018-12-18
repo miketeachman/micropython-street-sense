@@ -21,7 +21,10 @@ import ssd1306
 import pms5003
 import urtc
 from machine import I2S
-import gc
+import logging
+import ads1x15
+
+logging.basicConfig(level=logging.DEBUG)
 
 #    SPI Device
 #    - micro SD Card
@@ -45,7 +48,7 @@ import gc
 #    I2C Devices
 #    - SSD1306 OLED Display
 #    - DS3231 Real Time Clock
-#    - TODO Add external ADC to read Ozone and NO2 sensors
+#    - ADS1015 12-bit ADC
 #    
 #    I2C Connections
 #    Pin   Function
@@ -62,18 +65,20 @@ import gc
 #    27    SDIN
 #    
 
-LOGGING_INTERVAL_IN_SECS = 180.0
+LOGGING_INTERVAL_IN_SECS = 120.0
 
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
-SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 5
+SAMPLES_PER_SECOND = 20000
+RECORD_TIME_IN_SECONDS = 10
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
 NUM_BYTES_IN_SAMPLE_BLOCK = NUM_BYTES_IN_SDCARD_SECTOR * (NUM_BYTES_RX // NUM_BYTES_USED)
 NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_USED)
+
+PM25_POLLING_DELAY_MS = 500
 
 def gen_wav_header(
     sampleRate,
@@ -99,20 +104,26 @@ def gen_wav_header(
     return o
 
 # TODO combine ozone, no2 sensors into one class... after I2C ADC integration
+# Pass in ADC object? ... TODO think of how to abstract it... dHylands approach.
+
 class OzoneSensor():
     def __init__(self, barrier_read, barrier_data_ready):
         self.barrier_read = barrier_read
         self.barrier_data_ready = barrier_data_ready
         loop = asyncio.get_event_loop()
         loop.create_task(self.run()) 
+        self.v_gas = None
+        self.v_ref = None
         
+    async def get_ppm(self):
+        return self.v_gas
+    
     async def run(self):
         while True:
-            print('ozone...wait on barrier_read')
             await self.barrier_read
-            print('ozone...read sensor')
-            # TODO implement read of Spec Sensor Ozone sensor
-            print('ozone...wait on barrier_data_ready')
+            self.v_gas = adc.read(1)
+            yield
+            self.v_ref = adc.read(0)
             await self.barrier_data_ready
         
 class NO2Sensor():
@@ -120,15 +131,19 @@ class NO2Sensor():
         self.barrier_read = barrier_read
         self.barrier_data_ready = barrier_data_ready
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run())
+        self.v_gas = None
+        self.v_ref = None
+        
+    async def get_value(self):
+        return self.v_gas
         
     async def run(self):
         while True:
-            print('NO2...wait on barrier_read')
             await self.barrier_read
-            print('NO2...read sensor')
-            # TODO implement read of Spec Sensor NO2 sensor
-            print('NO2...wait on barrier_data_ready')
+            self.v_gas = adc.read(3)
+            yield
+            self.v_ref = adc.read(2)
             await self.barrier_data_ready
 
 class ParticulateSensor(pms5003.PMS5003):
@@ -152,17 +167,10 @@ class ParticulateSensor(pms5003.PMS5003):
     async def run(self):
         await self.stop() # place sensor in low power mode 
         while True:
-            print('PM2.5...wait on barrier_read')
             await self.barrier_read
-            print('PM2.5...STARTING sensor at {}'. format(ds3231.datetime()))
             await self.start()
-            print('PM2.5...waiting for event at {}'. format(ds3231.datetime()))
             await self.event_new_pm25_data
-            print('PM2.5...read sensor at {}'.format(ds3231.datetime()))
-            print('PM2.5 pm25_env = {}'.format(await self.get_value())) 
             self.event_new_pm25_data.clear() 
-            print('PM2.5...STOPPING sensor at {}'.format(ds3231.datetime()))
-            print('PM2.5...wait on barrier_data_ready')
             await self.barrier_data_ready
             await self.stop()
         
@@ -170,31 +178,30 @@ class ParticulateSensor(pms5003.PMS5003):
         return self.pm25_env
 
 class Display():
-    def __init__(self, barrier):
+    def __init__(self, barrier_sensor_data_ready):
         self.pm25 = None
         self.ozone = None
         self.no2 = None
         self.peakdb = None
-        print('Display...wait on barrier')
-        self.barrier = barrier
+        self.barrier_sensor_data_ready = barrier_sensor_data_ready
         loop = asyncio.get_event_loop()
         loop.create_task(self.run()) 
-        
-    # TODO 
-    #    remove COUPLING -- Display class should NOT
-    #    reach into other sensor classes to get data.
         
     async def run(self):
         while True:
             # show demo data for now
-            await self.barrier
+            await self.barrier_sensor_data_ready
             oled.fill(0)
-            oled.text("PM2.5:   {}".format(await ps.get_value()), 0, 0)
-            oled.text("Ozone:   33", 0, 8) # TODO - show sensor data
-            oled.text("NO2:      9", 0, 16) # TODO - show sensor data
-            oled.text("Peak dB: 76", 0, 24) # TODO - show sensor data
+            yield
+            oled.text("Ozone v_gas {}".format(ozone.v_gas), 0, 0)
+            yield
+            oled.text("Ozone v_ref {}".format(ozone.v_ref), 0, 8)
+            yield
+            oled.text("NO2 v_gas {}".format(no2.v_gas), 0, 16)
+            yield
+            oled.text("NO2 v_ref  {}".format(no2.v_ref), 0, 24)
+            yield
             oled.show()
-            await asyncio.sleep(1)
 
 class IntervalTimer():
     def __init__(self, barrier):
@@ -220,11 +227,9 @@ class IntervalTimer():
             ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
     
             # loop until the DS3231 alarm is detected 
-            # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
-                
-    
+
             sample_timestamp = urtc.tuple2seconds(ds3231.datetime())
             # clear alarm    
             ds3231.alarm(False, alarm=0)
@@ -241,20 +246,29 @@ class SDCardLogger():
         while True:
             s = open('/sd/samples.csv', 'a+')
             # wait until data for all sensors is available
-            print('SD Card Logger...wait on barrier')
             await self.barrier
+            
             # write sensor data to the SD Card in CSV form
-            print('LOG IT !!!')
-            numwrite = s.write('{}, {}\n'.format(sample_timestamp, await ps.get_value()))
+            numwrite = s.write('{}, {}, {}, {}, {}, {}\n'.format(
+                                                sample_timestamp, 
+                                                await ps.get_value(),
+                                                ozone.v_gas,
+                                                ozone.v_ref,
+                                                no2.v_gas,
+                                                no2.v_ref))
+            yield
             s.close()
+            yield
+            
             
             
 class Microphone():
     def __init__(self):
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run_mic()) 
+        pass
         
-    async def run(self):
+    async def run_mic(self):
         m=open('/sd/upy.wav','wb')
         wav_header = gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
                             SAMPLES_PER_SECOND * RECORD_TIME_IN_SECONDS)
@@ -263,36 +277,39 @@ class Microphone():
         numwrite = 0
         samples = bytearray(NUM_BYTES_IN_SAMPLE_BLOCK)
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
+        end = utime.ticks_us()
+
+        loop_count = 0
+        
+        sum_yield_delay = 0
+        max_yield_delay = 0
+        
+        sum_loop_time = 0
+        max_loop_time = 0
+        
+        sum_sdcard_write_time = 0
+        max_sdcard_write_time = 0
 
         for _ in range(NUM_SAMPLE_BYTES_IN_WAV // NUM_BYTES_IN_SDCARD_SECTOR):
             try:
                 # read sample block from microphone
-                numread = audio.readinto(samples) 
-                #await asyncio.sleep(0)
+                numread = audio.readinto(samples)
                 
                 # prune samples
                 for i in range(NUM_BYTES_IN_SAMPLE_BLOCK // NUM_BYTES_RX):
                     sd_sector[2*i] = samples[8*i + 2]
                     sd_sector[2*i + 1] = samples[8*i + 3]
-                #await asyncio.sleep(0)
                 
                 # write samples to SD Card
                 numwrite = m.write(sd_sector)
-                
-                t0 = utime.ticks_us()
-                await asyncio.sleep(0)
-                print("asyncio.sleep(0) took {} us".format(utime.ticks_us() - t0))
+                yield
                 
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
                 m.close()
                 audio.deinit()
         m.close()
-        audio.deinit()            
-
-#
-#  TODO add stretch goal:  calculate noise db from audio samples
-#
+        audio.deinit()
 
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
@@ -300,18 +317,26 @@ class Microphone():
 
 #
 #  TODO add MQTT sensor data push to either Thingspeak or Adafruit IO
-#            
-        
+#     
+
+# 
+# TODO add temperature sensor
+#
+
+#
+#  TODO add stretch goal:  calculate noise db from audio samples
+#
+
 async def idle():
     while True:
-        print("-- idle sleep")
         await asyncio.sleep(2)
         utime.sleep_us(1)
-        print(gc.mem_free())
- 
+        
 i2c = machine.I2C(scl=machine.Pin(22), sda=machine.Pin(21))
 ds3231 = urtc.DS3231(i2c, address=0x68)
 oled = ssd1306.SSD1306_I2C(128, 32, i2c)
+adc = ads1x15.ADS1015(i2c)
+adc.gain=1  # +- 4.096 range  TODO extend class - add method or init to set/get gain.
 uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
 
 # dmacount range:  2 to 128 incl
@@ -325,12 +350,15 @@ audio=I2S(id=I2S.NUM0,
           bits=I2S.BPS32,
           channelformat=I2S.RIGHT_LEFT,
           commformat=I2S.I2S|I2S.I2S_MSB,
-          dmacount=32,
+          dmacount=128,
           dmalen=128)
 
 sample_timestamp = None  #  TODO implement without using a global
 pms5003.set_debug(False)
 pms5003.WAIT_AFTER_WAKEUP = 30
+asyncio.set_debug(0)
+asyncio.core.set_debug(0)
+
 
 sdconfig = uos.sdconfig(
                         uos.SDMODE_SPI,
@@ -344,7 +372,7 @@ mount = uos.mountsd()
 
 loop = asyncio.get_event_loop()
 lock = asyn.Lock()
-event_new_pm25_data = asyn.Event() # TODO 200ms polling interval to reduce CPU overhead?
+event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS) 
 
 # TODO investigate making use of Barriers easier for a reader to understand
 barrier_read_all_sensors = asyn.Barrier(4)   
