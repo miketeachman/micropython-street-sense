@@ -1,0 +1,3 @@
+# Per default everything gets normalized and gets LF line endings on checkout.
+* text eol=lf
+

@@ -1,0 +1,13 @@
+# non-project folders
+######################
+external-modules/
+tests/
+working-releases/
+
+# eclipse generated files
+.project
+.pydevproject
+.settings/
+
+
+
