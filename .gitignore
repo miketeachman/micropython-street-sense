@@ -11,12 +11,14 @@ data-logs/
 .settings/
 
 # Kicad 
+######################
 # export files for BOM
 schematic/street_sense/*.csv
 schematic/street_sense/*.tsv
 schematic/street_sense/*.xml
 # backup files
 schematic/street_sense/*.bak
+schematic/street_sense/*.bck
 
 
 
