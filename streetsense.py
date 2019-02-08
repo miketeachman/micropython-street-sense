@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# Copyright (c) 2018 Mike Teachman
+# Copyright (c) 2019 Mike Teachman
 # https://opensource.org/licenses/MIT
 
 #
@@ -29,10 +29,10 @@ import urtc
 # 
 #    SPI Connections
 #    Pin   Function
-#    4     Tx
-#    18    Rx
-#    19    xx
-#    23    xx
+#    4     CS
+#    18    SCK
+#    19    MISO
+#    23    MOSI
 
 #    UART Device
 #    - PMS5003 Particulate Sensor
@@ -68,8 +68,8 @@ LOGGING_INTERVAL_IN_SECS = 60.0*2
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
-SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*5
+SAMPLES_PER_SECOND = 16000
+RECORD_TIME_IN_SECONDS = 60*60*2
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -113,11 +113,11 @@ class OzoneSensor():
         self.barrier_read = barrier_read
         self.barrier_data_ready = barrier_data_ready
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run_ozone()) 
         self.v_gas = None
         self.v_ref = None
         
-    async def run(self):
+    async def run_ozone(self):
         while True:
             await self.barrier_read
             self.v_gas = adc.read(1)
@@ -130,11 +130,11 @@ class NO2Sensor():
         self.barrier_read = barrier_read
         self.barrier_data_ready = barrier_data_ready
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run())
+        loop.create_task(self.run_no2())
         self.v_gas = None
         self.v_ref = None
         
-    async def run(self):
+    async def run_no2(self):
         while True:
             await self.barrier_read
             self.v_gas = adc.read(3)
@@ -157,9 +157,9 @@ class ParticulateSensor(pms5003.PMS5003):
                      active_mode = True, 
                      event = event_new_pm25_data)
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run_pm25()) 
         
-    async def run(self):
+    async def run_pm25(self):
         await self.stop() # place sensor in low power mode 
         while True:
             await self.barrier_read
@@ -176,9 +176,9 @@ class Display():
     def __init__(self, barrier_data_ready):
         self.barrier_data_ready = barrier_data_ready
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run_display()) 
         
-    async def run(self):
+    async def run_display(self):
         while True:
             # wait for display data to be ready
             await self.barrier_data_ready
@@ -199,9 +199,9 @@ class IntervalTimer():
     def __init__(self, barrier_read):
         self.barrier_read = barrier_read
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run_timer()) 
     
-    async def run(self):
+    async def run_timer(self):
         global sample_timestamp  # TODO fix this when interval timer becomes a class
         ds3231.alarm(False, alarm=0)  # TODO fix this coupling
         while True:
@@ -218,6 +218,8 @@ class IntervalTimer():
             wake_time_list[3]=None  
             ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
     
+            print(wake_time_list)
+            print('wait for alarm')
             # loop until the DS3231 alarm is detected 
             # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
             while ds3231.alarm(alarm=0) == False:
@@ -226,16 +228,17 @@ class IntervalTimer():
             sample_timestamp = urtc.tuple2seconds(ds3231.datetime())
             # clear alarm    
             ds3231.alarm(False, alarm=0)
-    
+            
+            print('read \'em')
             await self.barrier_read
 
 class SDCardLogger():
     def __init__(self, barrier_data_ready):
         self.barrier_data_ready = barrier_data_ready
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run()) 
+        loop.create_task(self.run_logger()) 
         
-    async def run(self):
+    async def run_logger(self):
         while True:
             s = open('/sd/samples.csv', 'a+')
             await asyncio.sleep(0)
@@ -262,17 +265,23 @@ class Microphone():
     async def run_mic(self):
         # dmacount range:  2 to 128 incl
         # dmalen range:   8 to 1024 incl
-        audio=I2S(id=I2S.NUM0,
-            sck=25,
-            ws=26,
-            sdin=27,
-            mode=I2S.MASTER|I2S.RX,
+        
+        
+        bck_pin = machine.Pin(25)
+        ws_pin = machine.Pin(26)
+        sdin_pin = machine.Pin(27)
+
+        audio=I2S(I2S.NUM0,
+            bck=bck_pin,
+            ws=ws_pin,
+            sdin=sdin_pin,
+            mode=I2S.MASTER_RX,
             samplerate=SAMPLES_PER_SECOND,
-            bits=I2S.BPS32,
+            dataformat=I2S.B32,
             channelformat=I2S.RIGHT_LEFT,
-            commformat=I2S.I2S|I2S.I2S_MSB,
-            dmacount=128,
-            dmalen=128)
+            standard=I2S.PHILIPS,
+            dmacount=32,
+            dmalen=256)
         timer = ms_timer.MillisecTimer()
         m=open('/sd/upy.wav','wb')
         wav_header = gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
@@ -282,11 +291,20 @@ class Microphone():
         numwrite = 0
         samples = bytearray(NUM_BYTES_IN_SAMPLE_BLOCK)
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
+        print('start mic')
         for _ in range(NUM_SAMPLE_BYTES_IN_WAV // NUM_BYTES_IN_SDCARD_SECTOR):
             try:
-                # read sample block from microphone
-                numread = audio.readinto(samples)
+                # loop until samples can be read from DMA
+                numread = 0
+                while numread == 0:
+                    # return immediately when no DMA buffer is available (timeout=0)
+                    # read sample block from microphone
+                    numread = audio.readinto(samples, timeout=0)
+                    
+                    # allow runtime for lower priority coroutines
+                    await timer(2)
                 
+                # TODO ++++++++++++++++  convert pruner to a function -- pass arrays
                 # prune sample block
                 for i in range(NUM_BYTES_IN_SAMPLE_BLOCK // NUM_BYTES_RX):
                     sd_sector[2*i] = samples[8*i + 2]
@@ -295,15 +313,15 @@ class Microphone():
                 # write samples to SD Card
                 numwrite = m.write(sd_sector)
                 
-                # allow runtime for lower priority coroutines                
-                await timer(2)
+                #await timer(2)
+
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
                 m.close()
                 audio.deinit()
         m.close()
         audio.deinit()
-        print('done')
+        print('done mic')
   
 async def idle():
     while True:
@@ -370,7 +388,7 @@ ps = ParticulateSensor(uart,
                        barrier_sensor_data_ready, 
                        event_new_pm25_data)
 display = Display(barrier_sensor_data_ready)
-iterval_timer = IntervalTimer(barrier_read_all_sensors)
+interval_timer = IntervalTimer(barrier_read_all_sensors)
 sdcard_logger = SDCardLogger(barrier_sensor_data_ready)
 mic = Microphone()
 loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
