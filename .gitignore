@@ -3,11 +3,20 @@
 external-modules/
 tests/
 working-releases/
+data-logs/
 
 # eclipse generated files
 .project
 .pydevproject
 .settings/
+
+# Kicad 
+# export files for BOM
+schematic/street_sense/*.csv
+schematic/street_sense/*.tsv
+schematic/street_sense/*.xml
+# backup files
+schematic/street_sense/*.bak
 
 
 

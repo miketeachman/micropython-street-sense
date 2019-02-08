@@ -1,3 +1,16 @@
 # Per default everything gets normalized and gets LF line endings on checkout.
 * text eol=lf
 
+# These should never be modified by git.
+*.png binary
+*.jpg binary
+*.dxf binary
+*.mpy binary
+
+# These will always have CRLF line endings on checkout.
+*.dcm text eol=crlf
+*.lib text eol=crlf
+*.net text eol=crlf
+*.pro text eol=crlf
+*.sch text eol=crlf
+sym-lib-table text eol=crlf
