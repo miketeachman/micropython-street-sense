@@ -6,8 +6,8 @@ $Descr A4 11693 8268
 encoding utf-8
 Sheet 1 1
 Title "Street Sense"
-Date "2019-02-08"
-Rev "v02"
+Date "2019-02-12"
+Rev "v03"
 Comp ""
 Comment1 ""
 Comment2 "https://opensource.org/licenses/MIT"
@@ -298,37 +298,24 @@ F 3 "" H 4450 4150 50  0001 C CNN
 $EndComp
 Wire Wire Line
 	4450 4150 4500 4150
-$Comp
-L power:GND #PWR03
-U 1 1 5C5E6B7E
-P 4450 4750
-F 0 "#PWR03" H 4450 4500 50  0001 C CNN
-F 1 "GND" H 4455 4577 50  0000 C CNN
-F 2 "" H 4450 4750 50  0001 C CNN
-F 3 "" H 4450 4750 50  0001 C CNN
-	1    4450 4750
-	1    0    0    -1  
-$EndComp
 Wire Wire Line
-	4450 4750 4450 4650
+	4500 4800 4500 4650
 Wire Wire Line
-	4450 4650 4500 4650
+	4500 2850 4100 2850
 Wire Wire Line
-	4500 2850 4200 2850
+	4100 2850 4100 4550
 Wire Wire Line
-	4200 2850 4200 4550
-Wire Wire Line
-	4200 4550 4500 4550
+	4100 4550 4500 4550
 Wire Wire Line
 	4500 2950 4300 2950
 Wire Wire Line
 	4300 2950 4300 4350
 Wire Wire Line
-	4500 3050 4100 3050
+	4500 3050 4200 3050
 Wire Wire Line
-	4100 3050 4100 4450
+	4200 3050 4200 4450
 Wire Wire Line
-	4100 4450 4500 4450
+	4200 4450 4500 4450
 Wire Wire Line
 	4300 4350 4500 4350
 Wire Wire Line
@@ -627,4 +614,52 @@ F 3 "" H 8600 4100 50  0001 C CNN
 	1    0    0    -1  
 $EndComp
 Connection ~ 3900 1400
+$Comp
+L Device:R R2
+U 1 1 5C630AD4
+P 4200 4750
+F 0 "R2" H 4270 4796 50  0000 L CNN
+F 1 "100k" H 4270 4705 50  0000 L CNN
+F 2 "" V 4130 4750 50  0001 C CNN
+F 3 "~" H 4200 4750 50  0001 C CNN
+	1    4200 4750
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GND #PWR03
+U 1 1 5C5E6B7E
+P 4500 4800
+F 0 "#PWR03" H 4500 4550 50  0001 C CNN
+F 1 "GND" H 4505 4627 50  0000 C CNN
+F 2 "" H 4500 4800 50  0001 C CNN
+F 3 "" H 4500 4800 50  0001 C CNN
+	1    4500 4800
+	1    0    0    -1  
+$EndComp
+$Comp
+L power:GND #PWR016
+U 1 1 5C6325CC
+P 4200 4950
+F 0 "#PWR016" H 4200 4700 50  0001 C CNN
+F 1 "GND" H 4205 4777 50  0000 C CNN
+F 2 "" H 4200 4950 50  0001 C CNN
+F 3 "" H 4200 4950 50  0001 C CNN
+	1    4200 4950
+	1    0    0    -1  
+$EndComp
+Wire Wire Line
+	4200 4450 4200 4600
+Connection ~ 4200 4450
+Wire Wire Line
+	4200 4950 4200 4900
+Wire Notes Line
+	1250 6500 1250 7500
+Wire Notes Line
+	1250 7500 3650 7500
+Wire Notes Line
+	3650 7500 3650 6500
+Wire Notes Line
+	3650 6500 1250 6500
+Text Notes 1400 6750 0    50   ~ 0
+Notes:\n- add schematic notes here
 $EndSCHEMATC
