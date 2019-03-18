@@ -18,7 +18,7 @@ import asyn
 import ms_timer
 import gc
 import logging
-import ads1x15
+from ads1219 import ADS1219
 import ssd1306
 import pms5003
 import urtc
@@ -42,11 +42,15 @@ import urtc
 #    32    Tx
 #    33    Rx
 #
+#    Sensor Power Control
+#    Pin   Function
+#    14    Pwr on/off
+#
 
 #    I2C Devices
 #    - SSD1306 OLED Display
 #    - DS3231 Real Time Clock
-#    - ADS1015 12-bit ADC
+#    - ADS1219 24-bit ADC
 #    
 #    I2C Connections
 #    Pin   Function
@@ -61,14 +65,14 @@ import urtc
 #    25    SCK
 #    26    WS
 #    27    SDIN
-#    
+#  
 
 LOGGING_INTERVAL_IN_SECS = 60.0*2
 
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
-SAMPLES_PER_SECOND = 16000
+SAMPLES_PER_SECOND = 10000
 RECORD_TIME_IN_SECONDS = 10
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
@@ -115,14 +119,15 @@ class OzoneSensor():
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_ozone()) 
         self.v_gas = None
-        self.v_ref = None
+        self.v_ref = None        
         
     async def run_ozone(self):
         while True:
             await self.barrier_read
-            self.v_gas = adc.read(1)
-            await asyncio.sleep(0)
-            self.v_ref = adc.read(0)
+            adc.set_channel(ADS1219.CHANNEL_AIN0)
+            self.v_ref = adc.read_data()
+            adc.set_channel(ADS1219.CHANNEL_AIN1)
+            self.v_gas = adc.read_data()
             await self.barrier_data_ready
         
 class NO2Sensor():
@@ -132,19 +137,19 @@ class NO2Sensor():
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_no2())
         self.v_gas = None
-        self.v_ref = None
+        self.v_ref = None        
         
     async def run_no2(self):
         while True:
             await self.barrier_read
-            self.v_gas = adc.read(3)
-            await asyncio.sleep(0)
-            self.v_ref = adc.read(2)
+            adc.set_channel(ADS1219.CHANNEL_AIN3)
+            self.v_ref = adc.read_data()
+            adc.set_channel(ADS1219.CHANNEL_AIN2)
+            self.v_gas = adc.read_data()
             await self.barrier_data_ready
 
 class ParticulateSensor(pms5003.PMS5003):
     def __init__(self, 
-                 uart, 
                  lock, 
                  barrier_read, 
                  barrier_data_ready, 
@@ -152,7 +157,8 @@ class ParticulateSensor(pms5003.PMS5003):
         self.barrier_read = barrier_read
         self.barrier_data_ready = barrier_data_ready
         self.event_new_pm25_data = event_new_pm25_data
-        super().__init__(uart, 
+        self.uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
+        super().__init__(self.uart, 
                      lock, 
                      active_mode = True, 
                      event = event_new_pm25_data)
@@ -160,14 +166,29 @@ class ParticulateSensor(pms5003.PMS5003):
         loop.create_task(self.run_pm25()) 
         
     async def run_pm25(self):
+        pm25_pwr_pin = machine.Pin(14, machine.Pin.OUT)
+        pm25_pwr_pin.value(1)
+        
+        print('stopping PM2.5')
         await self.stop() # place sensor in low power mode 
         while True:
             await self.barrier_read
+            print('starting PM2.5')
+            self.uart.init(tx=32, rx=33, baudrate=9600)
+            pm25_pwr_pin.value(1)
             await self.start()
             await self.event_new_pm25_data
             self.event_new_pm25_data.clear() 
             await self.barrier_data_ready
             await self.stop()
+            print('stopping PM2.5')
+            # Set Tx pin to input to workaround showstopper bug in UART.deinit() method
+            # want Tx as input so the sensor Rx input is not driven when it is powered off
+            # TODO:  fix hack below
+            machine.Pin(32, machine.Pin.IN)
+
+            #self.uart.deinit()  # BUG:  cannot deinit().  raises valueError exception
+            pm25_pwr_pin.value(0)
         
     async def get_value(self):
         return self.pm25_env
@@ -175,6 +196,10 @@ class ParticulateSensor(pms5003.PMS5003):
 class Display():
     def __init__(self, barrier_data_ready):
         self.barrier_data_ready = barrier_data_ready
+        oled.fill(0)
+        oled.text("Street Sense", 0, 0)
+        oled.text("Online", 0, 8)
+        oled.show()
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_display()) 
         
@@ -186,11 +211,7 @@ class Display():
             await asyncio.sleep(0)
             oled.text("Ozone v_gas {}".format(ozone.v_gas), 0, 0)
             await asyncio.sleep(0)
-            oled.text("Ozone v_ref {}".format(ozone.v_ref), 0, 8)
-            await asyncio.sleep(0)
-            oled.text("NO2 v_gas {}".format(no2.v_gas), 0, 16)
-            await asyncio.sleep(0)
-            oled.text("NO2 v_ref  {}".format(no2.v_ref), 0, 24)
+            oled.text("NO2 v_gas {}".format(no2.v_gas), 0, 8)
             await asyncio.sleep(0)
             oled.show()
             await asyncio.sleep(0)
@@ -219,7 +240,7 @@ class IntervalTimer():
             ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
     
             print(wake_time_list)
-            print('wait for alarm')
+            print('waiting for alarm')
             # loop until the DS3231 alarm is detected 
             # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
             while ds3231.alarm(alarm=0) == False:
@@ -229,7 +250,7 @@ class IntervalTimer():
             # clear alarm    
             ds3231.alarm(False, alarm=0)
             
-            print('read \'em')
+            print('read all sensors')
             await self.barrier_read
 
 class SDCardLogger():
@@ -245,13 +266,12 @@ class SDCardLogger():
             # wait until data for all sensors is available
             await self.barrier_data_ready
             # write sensor data to the SD Card in CSV format
-            numwrite = s.write('{}, {}, {}, {}, {}, {}\n'.format(
-                                                sample_timestamp, 
-                                                await ps.get_value(),
-                                                ozone.v_gas,
-                                                ozone.v_ref,
-                                                no2.v_gas,
-                                                no2.v_ref))
+            numwrite = s.write('{}, {}, {}, {}\n'.format(
+                                                        sample_timestamp, 
+                                                        await ps.get_value(),
+                                                        ozone.v_gas,
+                                                        no2.v_gas))
+            print('wrote log')
             await asyncio.sleep(0)
             s.close()
             await asyncio.sleep(0)
@@ -265,7 +285,6 @@ class Microphone():
     async def run_mic(self):
         # dmacount range:  2 to 128 incl
         # dmalen range:   8 to 1024 incl
-        
         
         bck_pin = machine.Pin(25)
         ws_pin = machine.Pin(26)
@@ -282,7 +301,7 @@ class Microphone():
             standard=I2S.PHILIPS,
             dmacount=32,
             dmalen=256)
-        timer = ms_timer.MillisecTimer()
+        timer_ms = ms_timer.MillisecTimer()
         m=open('/sd/upy.wav','wb')
         wav_header = gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
                             SAMPLES_PER_SECOND * RECORD_TIME_IN_SECONDS)
@@ -302,7 +321,7 @@ class Microphone():
                     numread = audio.readinto(samples, timeout=0)
                     
                     # allow runtime for lower priority coroutines
-                    await timer(2)
+                    await timer_ms(2)
                 
                 # TODO ++++++++++++++++  convert pruner to a function -- pass arrays
                 # prune sample block
@@ -313,7 +332,7 @@ class Microphone():
                 # write samples to SD Card
                 numwrite = m.write(sd_sector)
                 
-                #await timer(2)
+                await timer_ms(2)
 
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
@@ -322,6 +341,48 @@ class Microphone():
         m.close()
         audio.deinit()
         print('done mic')
+        
+class SpecTest():
+    def __init__(self):
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.run_spec()) 
+        
+    async def run_spec(self):
+        log_duration_in_s = 120
+        delay_ms = 500
+        # delete old logfile if it exists
+        files = uos.listdir("/sd")
+        if 'logfile.csv' in files:
+            print('removing old logfile')
+            uos.remove('/sd/logfile.csv')
+
+        log_file = open('/sd/logfile.csv', 'wt')
+        iterations = log_duration_in_s / (delay_ms * 2)
+        print('start Spec Sensor test')
+        while iterations:
+            adc.set_channel(ADS1219.CHANNEL_AIN0)
+            vref_ozone = adc.read_data()
+            await asyncio.sleep_ms(delay_ms)
+            adc.set_channel(ADS1219.CHANNEL_AIN1)
+            vgas_ozone = adc.read_data()
+            await asyncio.sleep_ms(delay_ms)
+            
+            adc.set_channel(ADS1219.CHANNEL_AIN3)
+            vref_no2 = adc.read_data()
+            await asyncio.sleep_ms(delay_ms)
+            adc.set_channel(ADS1219.CHANNEL_AIN2)
+            vgas_no2 = adc.read_data()
+            await asyncio.sleep_ms(delay_ms)
+            
+            log_string = '{}, {}, {:4.4f}, {:4.4f}, {:4.4f}, {:4.4f}\n'.format(
+                vgas_ozone, vgas_no2, vgas_ozone*2.048*1000/(2**23), vref_ozone*2.048*1000/(2**23),
+                vgas_no2*2.048*1000/(2**23), vref_no2*2.048*1000/(2**23))
+            log_file.write(log_string)
+            print(log_string)
+            iterations -= 1
+            await asyncio.sleep_ms(delay_ms)
+        log_file.close()   
+        print('end Spec Sensor test')
   
 async def idle():
     while True:
@@ -353,9 +414,11 @@ logging.basicConfig(level=logging.DEBUG)
 i2c = machine.I2C(scl=machine.Pin(22), sda=machine.Pin(21))
 ds3231 = urtc.DS3231(i2c, address=0x68)
 oled = ssd1306.SSD1306_I2C(128, 32, i2c)
-adc = ads1x15.ADS1015(i2c)
-adc.gain=1  # +- 4.096 range  TODO extend class - add method or init to set/get gain.
-uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
+adc = ADS1219(i2c)
+adc.set_conversion_mode(ADS1219.CM_SINGLE)
+adc.set_gain(ADS1219.GAIN_1X)
+adc.set_data_rate(ADS1219.DR_20_SPS)
+adc.set_vref(ADS1219.VREF_INTERNAL)
 
 sample_timestamp = None  #  TODO implement without using a global
 pms5003.set_debug(False)
@@ -382,8 +445,7 @@ barrier_read_all_sensors = asyn.Barrier(4)
 barrier_sensor_data_ready = asyn.Barrier(5)
 ozone = OzoneSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
 no2 = NO2Sensor(barrier_read_all_sensors, barrier_sensor_data_ready)
-ps = ParticulateSensor(uart, 
-                       lock, 
+ps = ParticulateSensor(lock, 
                        barrier_read_all_sensors, 
                        barrier_sensor_data_ready, 
                        event_new_pm25_data)
@@ -391,5 +453,6 @@ display = Display(barrier_sensor_data_ready)
 interval_timer = IntervalTimer(barrier_read_all_sensors)
 sdcard_logger = SDCardLogger(barrier_sensor_data_ready)
 mic = Microphone()
+spec_sensor_testing = SpecTest()
 loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
 loop.run_forever()

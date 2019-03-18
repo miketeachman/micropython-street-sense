@@ -1,3 +1,8 @@
 EESchema-DOCLIB  Version 2.0
 #
+$CMP ADS1219
+D 24-bit ADC
+K adc I2C
+$ENDCMP
+#
 #End Doc Library
