@@ -22,6 +22,7 @@ from ads1219 import ADS1219
 import ssd1306
 import pms5003
 import urtc
+from bitcrusher import bitcrusher
 
 
 #    SPI Device
@@ -62,9 +63,9 @@ import urtc
 #
 #    I2S Connections
 #    Pin   Function
-#    25    SCK
+#    27    SCK
 #    26    WS
-#    27    SDIN
+#    25    SDIN
 #  
 
 LOGGING_INTERVAL_IN_SECS = 60.0*2
@@ -286,9 +287,9 @@ class Microphone():
         # dmacount range:  2 to 128 incl
         # dmalen range:   8 to 1024 incl
         
-        bck_pin = machine.Pin(25)
+        bck_pin = machine.Pin(27)
         ws_pin = machine.Pin(26)
-        sdin_pin = machine.Pin(27)
+        sdin_pin = machine.Pin(25)
 
         audio=I2S(I2S.NUM0,
             bck=bck_pin,
@@ -323,16 +324,10 @@ class Microphone():
                     # allow runtime for lower priority coroutines
                     await timer_ms(2)
                 
-                # TODO ++++++++++++++++  convert pruner to a function -- pass arrays
-                # prune sample block
-                for i in range(NUM_BYTES_IN_SAMPLE_BLOCK // NUM_BYTES_RX):
-                    sd_sector[2*i] = samples[8*i + 2]
-                    sd_sector[2*i + 1] = samples[8*i + 3]
+                bitcrusher(samples, sd_sector)
                 
                 # write samples to SD Card
                 numwrite = m.write(sd_sector)
-                
-                await timer_ms(2)
 
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
