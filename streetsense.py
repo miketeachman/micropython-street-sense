@@ -24,7 +24,6 @@ import pms5003
 import urtc
 from bitcrusher import bitcrusher
 
-
 #    SPI Device
 #    - micro SD Card
 # 
@@ -59,22 +58,22 @@ from bitcrusher import bitcrusher
 #    22    SCL
 
 #    I2S Device
-#    - Adafruit I2S MEMS Microphone Breakout - SPH0645LM4H
+#    - INMP441 omnidirectional MEMS microphone
 #
 #    I2S Connections
 #    Pin   Function
 #    27    SCK
 #    26    WS
-#    25    SDIN
+#    25    SD
 #  
 
-LOGGING_INTERVAL_IN_SECS = 60.0*2
+LOGGING_INTERVAL_IN_SECS = 60.0*15
 
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 10
+RECORD_TIME_IN_SECONDS = 60*60*2
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -149,50 +148,58 @@ class NO2Sensor():
             self.v_gas = adc.read_data()
             await self.barrier_data_ready
 
-class ParticulateSensor(pms5003.PMS5003):
+#  TODO re-think design - what is the value in defining a class versus just a function?
+class ParticulateSensor():
     def __init__(self, 
                  lock, 
                  barrier_read, 
                  barrier_data_ready, 
                  event_new_pm25_data):
+        self.lock = lock
         self.barrier_read = barrier_read
         self.barrier_data_ready = barrier_data_ready
         self.event_new_pm25_data = event_new_pm25_data
         self.uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
-        super().__init__(self.uart, 
-                     lock, 
-                     active_mode = True, 
-                     event = event_new_pm25_data)
+        self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_pm25()) 
         
     async def run_pm25(self):
         pm25_pwr_pin = machine.Pin(14, machine.Pin.OUT)
-        pm25_pwr_pin.value(1)
-        
-        print('stopping PM2.5')
-        await self.stop() # place sensor in low power mode 
+        print('PM2.5:  power-down')
+        pm25_pwr_pin.value(0)
+
         while True:
             await self.barrier_read
-            print('starting PM2.5')
+            # TODO figure out why setting pin to OUT causes passive mode setting failures
+            #machine.Pin(32, machine.Pin.OUT)            
             self.uart.init(tx=32, rx=33, baudrate=9600)
+            print('PM2.5:  power-up')
             pm25_pwr_pin.value(1)
-            await self.start()
+            await asyncio.sleep(2) # allow pwr-up time before serial comms
+            print('PM2.5:  set Passive mode')
+            await self.pm25.setPassiveMode()
+            print('PM2.5:  30s warm-up')
+            await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
+            print('PM2.5:  read sensor')
+            await self.pm25.read()
+            print('PM2.5:  waiting for sensor event')
             await self.event_new_pm25_data
+            print('PM2.5:  got sensor event')
+            print('PM2.5:  value = {}'.format(await ps.get_value()))
             self.event_new_pm25_data.clear() 
             await self.barrier_data_ready
-            await self.stop()
-            print('stopping PM2.5')
+            print('PM2.5:  power-down')
             # Set Tx pin to input to workaround showstopper bug in UART.deinit() method
             # want Tx as input so the sensor Rx input is not driven when it is powered off
             # TODO:  fix hack below
-            machine.Pin(32, machine.Pin.IN)
+            #machine.Pin(32, machine.Pin.IN)
 
             #self.uart.deinit()  # BUG:  cannot deinit().  raises valueError exception
             pm25_pwr_pin.value(0)
         
     async def get_value(self):
-        return self.pm25_env
+        return self.pm25.pm25_env
 
 class Display():
     def __init__(self, barrier_data_ready):
@@ -417,7 +424,6 @@ adc.set_vref(ADS1219.VREF_INTERNAL)
 
 sample_timestamp = None  #  TODO implement without using a global
 pms5003.set_debug(False)
-pms5003.WAIT_AFTER_WAKEUP = 30
 asyncio.set_debug(0)
 asyncio.core.set_debug(0)
 
@@ -448,6 +454,6 @@ display = Display(barrier_sensor_data_ready)
 interval_timer = IntervalTimer(barrier_read_all_sensors)
 sdcard_logger = SDCardLogger(barrier_sensor_data_ready)
 mic = Microphone()
-spec_sensor_testing = SpecTest()
+#spec_sensor_testing = SpecTest()
 loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
 loop.run_forever()
