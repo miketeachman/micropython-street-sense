@@ -5,4 +5,10 @@ D 24-bit ADC
 K adc I2C
 $ENDCMP
 #
+$CMP Si7021_Module
+D Adafruit Si7021 Temperature & Humidity Sensor Breakout Board
+K I2C Humidity Temperature Sensor
+F https://www.adafruit.com/product/3251
+$ENDCMP
+#
 #End Doc Library

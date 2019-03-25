@@ -22,6 +22,7 @@ from ads1219 import ADS1219
 import ssd1306
 import pms5003
 import urtc
+import si7021
 from bitcrusher import bitcrusher
 
 #    SPI Device
@@ -67,13 +68,13 @@ from bitcrusher import bitcrusher
 #    25    SD
 #  
 
-LOGGING_INTERVAL_IN_SECS = 60.0*15
+LOGGING_INTERVAL_IN_SECS = 60.0*2
 
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60*2
+RECORD_TIME_IN_SECONDS = 10
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -147,6 +148,22 @@ class NO2Sensor():
             adc.set_channel(ADS1219.CHANNEL_AIN2)
             self.v_gas = adc.read_data()
             await self.barrier_data_ready
+            
+class THSensor():
+    def __init__(self, barrier_read, barrier_data_ready):
+        self.barrier_read = barrier_read
+        self.barrier_data_ready = barrier_data_ready
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.run_th())
+        self.temp_degc = None
+        self.humid_rh = None        
+        
+    async def run_th(self):
+        while True:
+            await self.barrier_read
+            self.temp_degc = temp_humid_sensor.temperature
+            self.humid_rh = temp_humid_sensor.relative_humidity
+            await self.barrier_data_ready            
 
 #  TODO re-think design - what is the value in defining a class versus just a function?
 class ParticulateSensor():
@@ -217,9 +234,13 @@ class Display():
             await self.barrier_data_ready
             oled.fill(0)
             await asyncio.sleep(0)
-            oled.text("Ozone v_gas {}".format(ozone.v_gas), 0, 0)
+            oled.text("O3 v_gas {}".format(ozone.v_gas), 0, 0)
             await asyncio.sleep(0)
             oled.text("NO2 v_gas {}".format(no2.v_gas), 0, 8)
+            await asyncio.sleep(0)
+            oled.text("Temp {:.1f}".format(temp_hum.temp_degc), 0, 16)
+            await asyncio.sleep(0)
+            oled.text("RH {:.1f}".format(temp_hum.humid_rh), 0, 24)
             await asyncio.sleep(0)
             oled.show()
             await asyncio.sleep(0)
@@ -274,11 +295,13 @@ class SDCardLogger():
             # wait until data for all sensors is available
             await self.barrier_data_ready
             # write sensor data to the SD Card in CSV format
-            numwrite = s.write('{}, {}, {}, {}\n'.format(
+            numwrite = s.write('{}, {}, {}, {}, {:.1f}, {:.1f}\n'.format(
                                                         sample_timestamp, 
                                                         await ps.get_value(),
                                                         ozone.v_gas,
-                                                        no2.v_gas))
+                                                        no2.v_gas,
+                                                        temp_hum.temp_degc,
+                                                        temp_hum.humid_rh))
             print('wrote log')
             await asyncio.sleep(0)
             s.close()
@@ -335,7 +358,7 @@ class Microphone():
                 
                 # write samples to SD Card
                 numwrite = m.write(sd_sector)
-
+                
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
                 m.close()
@@ -390,6 +413,8 @@ async def idle():
     while True:
         await asyncio.sleep(2)
         utime.sleep_us(1)
+        #print(gc.mem_free())
+
   
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
@@ -416,11 +441,12 @@ logging.basicConfig(level=logging.DEBUG)
 i2c = machine.I2C(scl=machine.Pin(22), sda=machine.Pin(21))
 ds3231 = urtc.DS3231(i2c, address=0x68)
 oled = ssd1306.SSD1306_I2C(128, 32, i2c)
-adc = ADS1219(i2c)
+adc = ADS1219(i2c, address=0x41)
 adc.set_conversion_mode(ADS1219.CM_SINGLE)
 adc.set_gain(ADS1219.GAIN_1X)
 adc.set_data_rate(ADS1219.DR_20_SPS)
 adc.set_vref(ADS1219.VREF_INTERNAL)
+temp_humid_sensor = si7021.Si7021(i2c)
 
 sample_timestamp = None  #  TODO implement without using a global
 pms5003.set_debug(False)
@@ -442,10 +468,11 @@ lock = asyn.Lock()
 event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS) 
 
 # TODO investigate making use of Barriers easier for a reader to understand
-barrier_read_all_sensors = asyn.Barrier(4)   
-barrier_sensor_data_ready = asyn.Barrier(5)
+barrier_read_all_sensors = asyn.Barrier(5)   
+barrier_sensor_data_ready = asyn.Barrier(4)
 ozone = OzoneSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
 no2 = NO2Sensor(barrier_read_all_sensors, barrier_sensor_data_ready)
+temp_hum = THSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
 ps = ParticulateSensor(lock, 
                        barrier_read_all_sensors, 
                        barrier_sensor_data_ready, 
