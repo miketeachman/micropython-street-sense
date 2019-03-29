@@ -7,16 +7,18 @@
 # https://hackaday.io/project/162059-street-sense
 #
 
+import gc
 import sys
 import math
 import machine
 from machine import I2S
 import uos
 import utime
+from mqtt_as import MQTTClient
+from mqtt_config import mqtt_config
 import uasyncio as asyncio
 import asyn
 import ms_timer
-import gc
 import logging
 from ads1219 import ADS1219
 import ssd1306
@@ -218,6 +220,43 @@ class ParticulateSensor():
     async def get_value(self):
         return self.pm25.pm25_env
 
+class IntervalTimer():
+    def __init__(self, barrier_read):
+        self.barrier_read = barrier_read
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.run_timer()) 
+    
+    async def run_timer(self):
+        global sample_timestamp  # TODO fix this when interval timer becomes a class
+        ds3231.alarm(False, alarm=0)  # TODO fix this coupling
+        while True:
+            time_now = urtc.tuple2seconds(ds3231.datetime())
+            # calculate the next alarm time, aligned to the desired interval
+            # e.g.  interval=15mins ==>  align to 00, 15, 30, 45 mins
+            time_now += 5  # to eliminate risk of timing hazard close to interval boundary
+            wake_time = int(math.ceil(time_now / LOGGING_INTERVAL_IN_SECS) * LOGGING_INTERVAL_IN_SECS)
+            
+            # set day-of-week (4th element) to None so alarm uses day-of-month (urtc module API requirement)
+            # some gymnastics needed ...
+            wake_time_tuple = urtc.seconds2tuple(int(wake_time))
+            wake_time_list = list(wake_time_tuple)
+            wake_time_list[3]=None  
+            ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
+    
+            print('next sensor read at {}'.format(wake_time_list))
+            print('waiting for DS3231 alarm')
+            # loop until the DS3231 alarm is detected 
+            # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
+            while ds3231.alarm(alarm=0) == False:
+                await asyncio.sleep_ms(250)
+
+            sample_timestamp = urtc.tuple2seconds(ds3231.datetime())
+            # clear alarm    
+            ds3231.alarm(False, alarm=0)
+            
+            print('DS3231 alarm -> read all sensors')
+            await self.barrier_read
+
 class Display():
     def __init__(self, barrier_data_ready):
         self.barrier_data_ready = barrier_data_ready
@@ -245,43 +284,6 @@ class Display():
             oled.show()
             await asyncio.sleep(0)
 
-class IntervalTimer():
-    def __init__(self, barrier_read):
-        self.barrier_read = barrier_read
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_timer()) 
-    
-    async def run_timer(self):
-        global sample_timestamp  # TODO fix this when interval timer becomes a class
-        ds3231.alarm(False, alarm=0)  # TODO fix this coupling
-        while True:
-            time_now = urtc.tuple2seconds(ds3231.datetime())
-            # calculate the next alarm time, aligned to the desired interval
-            # e.g.  interval=15mins ==>  align to 00, 15, 30, 45 mins
-            time_now += 5  # to eliminate risk of timing hazard close to interval boundary
-            wake_time = int(math.ceil(time_now / LOGGING_INTERVAL_IN_SECS) * LOGGING_INTERVAL_IN_SECS)
-            
-            # set day-of-week (4th element) to None so alarm uses day-of-month (urtc module API requirement)
-            # some gymnastics needed ...
-            wake_time_tuple = urtc.seconds2tuple(int(wake_time))
-            wake_time_list = list(wake_time_tuple)
-            wake_time_list[3]=None  
-            ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
-    
-            print(wake_time_list)
-            print('waiting for alarm')
-            # loop until the DS3231 alarm is detected 
-            # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
-            while ds3231.alarm(alarm=0) == False:
-                await asyncio.sleep_ms(250)
-
-            sample_timestamp = urtc.tuple2seconds(ds3231.datetime())
-            # clear alarm    
-            ds3231.alarm(False, alarm=0)
-            
-            print('read all sensors')
-            await self.barrier_read
-
 class SDCardLogger():
     def __init__(self, barrier_data_ready):
         self.barrier_data_ready = barrier_data_ready
@@ -306,7 +308,39 @@ class SDCardLogger():
             await asyncio.sleep(0)
             s.close()
             await asyncio.sleep(0)
-            
+
+class MQTTPublish():
+    def __init__(self, barrier_data_ready):    
+        self.barrier_data_ready = barrier_data_ready
+        MQTTClient.DEBUG = False
+        self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'PM25'), 'utf-8')
+        self.feedname_o3 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'o3'), 'utf-8')
+        self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
+        self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'TdegC'), 'utf-8')
+        self.feedname_humidity = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'humidity'), 'utf-8')
+        
+        self.client = MQTTClient(server='io.adafruit.com', 
+                                 ssid=mqtt_config['ssid'], 
+                                 wifi_pw=mqtt_config['wifi_pw'], 
+                                 user=mqtt_config['user'], 
+                                 password=mqtt_config['password'])
+        loop = asyncio.get_event_loop()
+        try:
+            loop.create_task(self.run_mqtt())
+        finally:
+            self.client.close()  # Prevent LmacRxBlk:1 errors    
+        
+    async def run_mqtt(self):
+        await self.client.connect()
+        while True:
+            print('MQTT: waiting for barrier')
+            await self.barrier_data_ready
+            print('publish')
+            await self.client.publish(self.feedname_pm25, '{}'.format(await ps.get_value()), qos = 0)
+            await self.client.publish(self.feedname_o3, '{}'.format(ozone.v_gas), qos = 0)
+            await self.client.publish(self.feedname_no2, '{}'.format(no2.v_gas), qos = 0)
+            await self.client.publish(self.feedname_temp, '{:.1f}'.format(temp_hum.temp_degc), qos = 0)
+            await self.client.publish(self.feedname_humidity, '{:.1f}'.format(temp_hum.humid_rh), qos = 0)
             
 class Microphone():
     def __init__(self):
@@ -339,6 +373,8 @@ class Microphone():
         m.write(wav_header)
         numread = 0
         numwrite = 0
+        count_i2sread = 0
+        count_sdwrite = 0
         samples = bytearray(NUM_BYTES_IN_SAMPLE_BLOCK)
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
         print('start mic')
@@ -350,7 +386,8 @@ class Microphone():
                     # return immediately when no DMA buffer is available (timeout=0)
                     # read sample block from microphone
                     numread = audio.readinto(samples, timeout=0)
-                    
+                    count_i2sread += 1
+
                     # allow runtime for lower priority coroutines
                     await timer_ms(2)
                 
@@ -358,6 +395,7 @@ class Microphone():
                 
                 # write samples to SD Card
                 numwrite = m.write(sd_sector)
+                count_sdwrite += 1
                 
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
@@ -365,7 +403,7 @@ class Microphone():
                 audio.deinit()
         m.close()
         audio.deinit()
-        print('done mic')
+        print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
         
 class SpecTest():
     def __init__(self):
@@ -469,7 +507,7 @@ event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS)
 
 # TODO investigate making use of Barriers easier for a reader to understand
 barrier_read_all_sensors = asyn.Barrier(5)   
-barrier_sensor_data_ready = asyn.Barrier(4)
+barrier_sensor_data_ready = asyn.Barrier(7)
 ozone = OzoneSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
 no2 = NO2Sensor(barrier_read_all_sensors, barrier_sensor_data_ready)
 temp_hum = THSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
@@ -481,6 +519,7 @@ display = Display(barrier_sensor_data_ready)
 interval_timer = IntervalTimer(barrier_read_all_sensors)
 sdcard_logger = SDCardLogger(barrier_sensor_data_ready)
 mic = Microphone()
+mqtt = MQTTPublish(barrier_sensor_data_ready)
 #spec_sensor_testing = SpecTest()
 loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
 loop.run_forever()
