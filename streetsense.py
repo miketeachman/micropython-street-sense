@@ -76,18 +76,18 @@ NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 10
+RECORD_TIME_IN_SECONDS = 60*5
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
 NUM_BYTES_IN_SAMPLE_BLOCK = NUM_BYTES_IN_SDCARD_SECTOR * (NUM_BYTES_RX // NUM_BYTES_USED)
 NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_USED)
+NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
 PM25_POLLING_DELAY_MS = 500
 
-# run many short garbage collections rather than one long one.
-# goal:  reduce the max time that a coroutine is blocked from running         
-GC_THRESHOLD = 300000
+# thresholds < 20480 will result in GC only on-demand (when allocation fails)        
+GC_THRESHOLD = 10
 
 def gen_wav_header(
     sampleRate,
@@ -179,23 +179,52 @@ class ParticulateSensor():
         self.barrier_data_ready = barrier_data_ready
         self.event_new_pm25_data = event_new_pm25_data
         self.uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
-        self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_pm25()) 
         
     async def run_pm25(self):
         pm25_pwr_pin = machine.Pin(14, machine.Pin.OUT)
-        print('PM2.5:  power-down')
-        pm25_pwr_pin.value(0)
 
         while True:
+            # Next section of code sets UART Tx and Rx pins as inputs with pull downs
+            # This is done to make sure Tx and Rx are at zero volts
+            # before the particulate sensor is powered off
+            # A non-obvious sequence of events is needed to achieve this:
+            # 1. deinit_start():  flags the UART task to stop running
+            # 2. test UART task in a non-blocking wait loop until it stops
+            # 3. deinit_finish():  final steps to terminate the UART task
+            # 4. set Tx and Rx pins as pulled-down inputs
+            # 5. power down the particulate sensor
+            self.uart.deinit_start()
+            iter = 50
+            while iter and self.uart.is_task_running():
+                await asyncio.sleep_ms(100)
+                iter -= 1
+                
+            if not iter:
+                raise ValueError('could not stop UART task')
+            else:
+                self.uart.deinit_finish()
+
+            machine.Pin(32, machine.Pin.IN, machine.Pin.PULL_DOWN)
+            machine.Pin(33, machine.Pin.IN, machine.Pin.PULL_DOWN)
+            
+            print('PM2.5:  power-down')
+            pm25_pwr_pin.value(0)
+
             await self.barrier_read
-            # TODO figure out why setting pin to OUT causes passive mode setting failures
-            #machine.Pin(32, machine.Pin.OUT)            
-            self.uart.init(tx=32, rx=33, baudrate=9600)
             print('PM2.5:  power-up')
             pm25_pwr_pin.value(1)
-            await asyncio.sleep(2) # allow pwr-up time before serial comms
+            await asyncio.sleep(2) # allow pwr-up time
+            # reinitialize the UART as means have the GPIO pins
+            # working as Tx and Rx 
+            # note:  reinitialize PMS5003 sensor so the new UART object is 
+            #        associated with the PMS5003 object
+            self.uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
+            self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
+            await asyncio.sleep(1)
+            # TODO do some scope investigation to see how long it takes
+            # for sensor to autonomously send the first data on Rx
             print('PM2.5:  set Passive mode')
             await self.pm25.setPassiveMode()
             print('PM2.5:  30s warm-up')
@@ -208,14 +237,6 @@ class ParticulateSensor():
             print('PM2.5:  value = {}'.format(await ps.get_value()))
             self.event_new_pm25_data.clear() 
             await self.barrier_data_ready
-            print('PM2.5:  power-down')
-            # Set Tx pin to input to workaround showstopper bug in UART.deinit() method
-            # want Tx as input so the sensor Rx input is not driven when it is powered off
-            # TODO:  fix hack below
-            #machine.Pin(32, machine.Pin.IN)
-
-            #self.uart.deinit()  # BUG:  cannot deinit().  raises valueError exception
-            pm25_pwr_pin.value(0)
         
     async def get_value(self):
         return self.pm25.pm25_env
@@ -306,13 +327,14 @@ class SDCardLogger():
                                                         temp_hum.humid_rh))
             print('wrote log')
             await asyncio.sleep(0)
+            print('Logger:  s.close')
             s.close()
             await asyncio.sleep(0)
 
 class MQTTPublish():
     def __init__(self, barrier_data_ready):    
         self.barrier_data_ready = barrier_data_ready
-        MQTTClient.DEBUG = False
+        MQTTClient.DEBUG = True
         self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'PM25'), 'utf-8')
         self.feedname_o3 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'o3'), 'utf-8')
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
@@ -332,15 +354,18 @@ class MQTTPublish():
         
     async def run_mqtt(self):
         await self.client.connect()
+        self.client.pause()
         while True:
-            print('MQTT: waiting for barrier')
             await self.barrier_data_ready
-            print('publish')
+            self.client.resume()
             await self.client.publish(self.feedname_pm25, '{}'.format(await ps.get_value()), qos = 0)
             await self.client.publish(self.feedname_o3, '{}'.format(ozone.v_gas), qos = 0)
             await self.client.publish(self.feedname_no2, '{}'.format(no2.v_gas), qos = 0)
             await self.client.publish(self.feedname_temp, '{:.1f}'.format(temp_hum.temp_degc), qos = 0)
             await self.client.publish(self.feedname_humidity, '{:.1f}'.format(temp_hum.humid_rh), qos = 0)
+            # pausing the MQTT client will turn off the WiFi radio
+            # which reduces the processor power usage
+            self.client.pause()            
             
 class Microphone():
     def __init__(self):
@@ -364,7 +389,7 @@ class Microphone():
             dataformat=I2S.B32,
             channelformat=I2S.RIGHT_LEFT,
             standard=I2S.PHILIPS,
-            dmacount=32,
+            dmacount=64,
             dmalen=256)
         timer_ms = ms_timer.MillisecTimer()
         m=open('/sd/upy.wav','wb')
@@ -373,29 +398,54 @@ class Microphone():
         m.write(wav_header)
         numread = 0
         numwrite = 0
-        count_i2sread = 0
-        count_sdwrite = 0
+        bytes_in_dma_memory = 0
+        overrun_count = 0
+        sdwrite_over_100ms = 0
+        sdwrite_50_to_100ms = 0
+        sdwrite_count = 0
+        dma_byte_capacity = 64 * 256 * NUM_BYTES_RX  # dmacount*dmalen*8
         samples = bytearray(NUM_BYTES_IN_SAMPLE_BLOCK)
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
-        print('start mic')
-        for _ in range(NUM_SAMPLE_BYTES_IN_WAV // NUM_BYTES_IN_SDCARD_SECTOR):
+        bytes_remaining_to_rx = NUM_SAMPLE_BYTES_TO_RX
+        print('Mic:  Start')
+        while bytes_remaining_to_rx > 0:
             try:
-                # loop until samples can be read from DMA
-                numread = 0
-                while numread == 0:
-                    # return immediately when no DMA buffer is available (timeout=0)
-                    # read sample block from microphone
-                    numread = audio.readinto(samples, timeout=0)
-                    count_i2sread += 1
+                start_ticks_us = utime.ticks_us()
 
-                    # allow runtime for lower priority coroutines
+                # read samples from microphone
+                numread = audio.readinto(samples, timeout=0)
+                bytes_remaining_to_rx -= numread
+                
+                if numread == 0:
+                    # no samples available in DMA memory
+                    # allow lower priority coroutines to run
                     await timer_ms(2)
+                    bytes_in_dma_memory = 0
+                else:
+                    bytes_in_dma_memory -= numread
+                    
+                    # reduce sample resolution to 16 bits
+                    bitcrusher(samples, sd_sector)
                 
-                bitcrusher(samples, sd_sector)
-                
-                # write samples to SD Card
-                numwrite = m.write(sd_sector)
-                count_sdwrite += 1
+                    # write samples to SD Card
+                    start_sd_write = utime.ticks_us()
+                    #utime.sleep_us(3000)
+                    numwrite = m.write(sd_sector)
+                    end_sd_write = utime.ticks_us()
+                    sdwrite_count += 1
+                    
+                    sd_write_time = end_sd_write - start_sd_write
+                    if (sd_write_time) > 100*1000:  # 100ms
+                        sdwrite_over_100ms += 1
+                    elif (sd_write_time) > 50*1000:  # 50ms
+                        sdwrite_50_to_100ms += 1
+                    
+                end_ticks_us = utime.ticks_us()
+                # TODO use ticks diff us routine
+                bytes_in_dma_memory += ((end_ticks_us - start_ticks_us) * (SAMPLES_PER_SECOND * NUM_BYTES_RX)) // 1000000
+                if bytes_in_dma_memory > dma_byte_capacity:
+                    overrun_count += 1
+                    #print('Mic:  DMA overrun!, count= ', overrun_count)
                 
             except Exception as e:
                 print('unexpected exception {} {}'.format(type(e).__name__, e))
@@ -403,7 +453,10 @@ class Microphone():
                 audio.deinit()
         m.close()
         audio.deinit()
-        print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
+        print('================ Mic:  Done ======================')
+        print('Mic Stats:  overrun_count: {}, sdwrite_50_to_100ms: {}, sdwrite_over_100ms: {}, sdwrite_count:  {}'.format(overrun_count, sdwrite_50_to_100ms, sdwrite_over_100ms, sdwrite_count))
+        #machine.reset()
+        #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
         
 class SpecTest():
     def __init__(self):
