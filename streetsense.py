@@ -12,6 +12,10 @@ import sys
 import math
 import machine
 from machine import I2S
+from machine import I2C
+from machine import Pin
+from machine import UART
+from array import array
 import uos
 import utime
 from mqtt_as import MQTTClient
@@ -69,6 +73,9 @@ from bitcrusher import bitcrusher
 #    26    WS
 #    25    SD
 #  
+#    ADS1219 ADC
+#    Pin   Function
+#    34    DRDY
 
 LOGGING_INTERVAL_IN_SECS = 60.0*2
 
@@ -76,7 +83,7 @@ NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*5
+RECORD_TIME_IN_SECONDS = 60*60*1
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -112,138 +119,157 @@ def gen_wav_header(
     o += datasize.to_bytes(4, 'little')  # (4byte) Data size in bytes
     return o
 
-# TODO combine ozone, no2 sensors into one class... after I2C ADC integration
-# Pass in ADC object? ... TODO think of how to abstract it
+# TODO pass in ADC object
+class SpecSensors():
+    SAMPLES_TO_CAPTURE = 100
+    CALIBRATION_FACTOR_OZONE = (-21.7913*(10**-3))  # mV/ppb
+    CALIBRATION_FACTOR_NO2 = (-11.13768*(10**-3))   # mV/ppb
+                          
+    def __init__(self):
+        self.sample_count = 0
+        self.sample_sum = 2**32-1   # allocate 4 byte sample to be used in ISR  TODO needed?
 
-class OzoneSensor():
-    def __init__(self, barrier_read, barrier_data_ready):
-        self.barrier_read = barrier_read
-        self.barrier_data_ready = barrier_data_ready
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_ozone()) 
-        self.v_gas = None
-        self.v_ref = None        
+        adc.set_channel(ADS1219.CHANNEL_AIN0)
+        adc.set_conversion_mode(ADS1219.CM_SINGLE)
+        adc.set_gain(ADS1219.GAIN_1X)
+        adc.set_data_rate(ADS1219.DR_20_SPS)
+        adc.set_vref(ADS1219.VREF_INTERNAL)
+        self.drdy_pin = Pin(34, mode=Pin.IN, trigger=Pin.IRQ_DISABLE, handler=self.callback)        
+        self.ozone_v_gas = None
+        self.ozone_v_ref = None
+        self.ozone_ppb = None
+        self.no2_v_gas = None        
+        self.no2_v_ref = None
+        self.no2_ppb = None        
         
-    async def run_ozone(self):
-        while True:
-            await self.barrier_read
-            adc.set_channel(ADS1219.CHANNEL_AIN0)
-            self.v_ref = adc.read_data()
-            adc.set_channel(ADS1219.CHANNEL_AIN1)
-            self.v_gas = adc.read_data()
-            await self.barrier_data_ready
+    def callback(self, arg):
+        if self.sample_count < self.SAMPLES_TO_CAPTURE:
+            self.sample_sum += adc.read_data_irq()
+            self.sample_count += 1
+            # re-enable interrupt
+            self.drdy_pin.init(trigger=Pin.IRQ_LOLEVEL)
         
-class NO2Sensor():
-    def __init__(self, barrier_read, barrier_data_ready):
-        self.barrier_read = barrier_read
-        self.barrier_data_ready = barrier_data_ready
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_no2())
-        self.v_gas = None
-        self.v_ref = None        
+    async def read(self, adc_channel):
+        print('adc_channel=', adc_channel)
+        self.sample_sum= 0 
+        self.sample_count = 0     
+        adc.set_channel(adc_channel)
+        adc.set_conversion_mode(ADS1219.CM_CONTINUOUS)
+        adc.set_gain(ADS1219.GAIN_1X)
+        adc.set_data_rate(ADS1219.DR_20_SPS)
+        adc.set_vref(ADS1219.VREF_INTERNAL)
+        adc.start_sync() # starts continuous sampling
         
-    async def run_no2(self):
-        while True:
-            await self.barrier_read
-            adc.set_channel(ADS1219.CHANNEL_AIN3)
-            self.v_ref = adc.read_data()
-            adc.set_channel(ADS1219.CHANNEL_AIN2)
-            self.v_gas = adc.read_data()
-            await self.barrier_data_ready
-            
+        await asyncio.sleep(1)
+        print('start', utime.ticks_ms())
+
+        self.drdy_pin.init(trigger=Pin.IRQ_LOLEVEL)
+        
+        while self.sample_count < self.SAMPLES_TO_CAPTURE:
+            #print(self.sample_count)
+            await asyncio.sleep_ms(10)
+
+        self.drdy_pin.init(trigger=Pin.IRQ_DISABLE)
+        print('done', utime.ticks_ms())
+        
+        adc.set_conversion_mode(ADS1219.CM_SINGLE)
+        
+        avg_mv = self.sample_sum*2.048*1000/(2**23)/self.sample_count
+        print("avg_mv = ", avg_mv)
+        
+        return avg_mv
+    
+    async def read_all(self):
+        # read Ozone gas voltage
+        self.ozone_v_gas = await self.read(ADS1219.CHANNEL_AIN1)        
+        # read Ozone reference voltage
+        self.ozone_v_ref = await self.read(ADS1219.CHANNEL_AIN0)        
+        # read NO2 gas voltage
+        self.no2_v_gas = await self.read(ADS1219.CHANNEL_AIN2)        
+        # read NO2 reference voltage
+        self.no2_v_ref = await self.read(ADS1219.CHANNEL_AIN3)        
+        
+        # calculate gas concentration in parts-per-billion (ppb)
+        # TODO calibrate Spec Sensors, with offset
+        self.ozone_ppb = (self.ozone_v_gas - self.ozone_v_ref) / self.CALIBRATION_FACTOR_OZONE
+        self.no2_ppb = (self.no2_v_gas - self.no2_v_ref) / self.CALIBRATION_FACTOR_NO2
+        
 class THSensor():
-    def __init__(self, barrier_read, barrier_data_ready):
-        self.barrier_read = barrier_read
-        self.barrier_data_ready = barrier_data_ready
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_th())
+    def __init__(self):
         self.temp_degc = None
         self.humid_rh = None        
         
-    async def run_th(self):
-        while True:
-            await self.barrier_read
-            self.temp_degc = temp_humid_sensor.temperature
-            self.humid_rh = temp_humid_sensor.relative_humidity
-            await self.barrier_data_ready            
+    async def read(self):
+        self.temp_degc = temp_humid_sensor.temperature
+        self.humid_rh = temp_humid_sensor.relative_humidity
 
-#  TODO re-think design - what is the value in defining a class versus just a function?
 class ParticulateSensor():
     def __init__(self, 
                  lock, 
-                 barrier_read, 
-                 barrier_data_ready, 
                  event_new_pm25_data):
         self.lock = lock
-        self.barrier_read = barrier_read
-        self.barrier_data_ready = barrier_data_ready
         self.event_new_pm25_data = event_new_pm25_data
-        self.uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_pm25()) 
+        self.pm25_reading = None
         
-    async def run_pm25(self):
-        pm25_pwr_pin = machine.Pin(14, machine.Pin.OUT)
+    async def read_pm25(self):
+        pm25_pwr_pin = Pin(14, Pin.OUT)
 
-        while True:
-            # Next section of code sets UART Tx and Rx pins as inputs with pull downs
-            # This is done to make sure Tx and Rx are at zero volts
-            # before the particulate sensor is powered off
-            # A non-obvious sequence of events is needed to achieve this:
-            # 1. deinit_start():  flags the UART task to stop running
-            # 2. test UART task in a non-blocking wait loop until it stops
-            # 3. deinit_finish():  final steps to terminate the UART task
-            # 4. set Tx and Rx pins as pulled-down inputs
-            # 5. power down the particulate sensor
-            self.uart.deinit_start()
-            iter = 50
-            while iter and self.uart.is_task_running():
-                await asyncio.sleep_ms(100)
-                iter -= 1
-                
-            if not iter:
-                raise ValueError('could not stop UART task')
-            else:
-                self.uart.deinit_finish()
+        print('PM2.5:  power-up')
+        pm25_pwr_pin.value(1)
+        print('PM2.5:  30s warm-up')
+        await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
 
-            machine.Pin(32, machine.Pin.IN, machine.Pin.PULL_DOWN)
-            machine.Pin(33, machine.Pin.IN, machine.Pin.PULL_DOWN)
+        # reinitialize the UART as means have the GPIO pins
+        # working as Tx and Rx 
+        # note:  reinitialize PMS5003 sensor so the new UART object is 
+        #        associated with the PMS5003 object
+        self.uart = UART(1, tx=32, rx=33, baudrate=9600)
+        self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
+        await asyncio.sleep(1)
+        print('PM2.5:  set Passive mode')
+        await self.pm25.setPassiveMode()
+        print('PM2.5:  read sensor')
+        await asyncio.sleep(1)
+        await self.pm25.read()
+        print('PM2.5:  waiting for sensor event')
+        await self.event_new_pm25_data
+        print('PM2.5:  got sensor event')
+        self.pm25_reading = await ps.get_value()
+        print('PM2.5:  value = {}'.format(self.pm25_reading))
+        self.event_new_pm25_data.clear() 
+        
+        # Next section of code sets UART Tx and Rx pins as inputs with pull downs
+        # This is done to make sure Tx and Rx are at zero volts
+        # before the particulate sensor is powered off
+        # A non-obvious sequence of events is needed to achieve this:
+        # 1. deinit_start():  flags the UART task to stop running
+        # 2. test UART task in a non-blocking wait loop until it stops
+        # 3. deinit_finish():  final steps to terminate the UART task
+        # 4. set Tx and Rx pins as pulled-down inputs
+        # 5. power down the particulate sensor
+        self.uart.deinit_start()
+        iter = 50
+        while iter and self.uart.is_task_running():
+            await asyncio.sleep_ms(100)
+            iter -= 1
             
-            print('PM2.5:  power-down')
-            pm25_pwr_pin.value(0)
+        if not iter:
+            raise ValueError('could not stop UART task')
+        else:
+            self.uart.deinit_finish()
 
-            await self.barrier_read
-            print('PM2.5:  power-up')
-            pm25_pwr_pin.value(1)
-            await asyncio.sleep(2) # allow pwr-up time
-            # reinitialize the UART as means have the GPIO pins
-            # working as Tx and Rx 
-            # note:  reinitialize PMS5003 sensor so the new UART object is 
-            #        associated with the PMS5003 object
-            self.uart = machine.UART(1, tx=32, rx=33, baudrate=9600)
-            self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
-            await asyncio.sleep(1)
-            # TODO do some scope investigation to see how long it takes
-            # for sensor to autonomously send the first data on Rx
-            print('PM2.5:  set Passive mode')
-            await self.pm25.setPassiveMode()
-            print('PM2.5:  30s warm-up')
-            await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
-            print('PM2.5:  read sensor')
-            await self.pm25.read()
-            print('PM2.5:  waiting for sensor event')
-            await self.event_new_pm25_data
-            print('PM2.5:  got sensor event')
-            print('PM2.5:  value = {}'.format(await ps.get_value()))
-            self.event_new_pm25_data.clear() 
-            await self.barrier_data_ready
+        Pin(32, Pin.IN, Pin.PULL_DOWN)
+        Pin(33, Pin.IN, Pin.PULL_DOWN)
+        
+        print('PM2.5:  power-down')
+        pm25_pwr_pin.value(0)
         
     async def get_value(self):
         return self.pm25.pm25_env
 
 class IntervalTimer():
-    def __init__(self, barrier_read):
-        self.barrier_read = barrier_read
+    def __init__(self, event_mqtt_publish):    
+        self.event_mqtt_publish = event_mqtt_publish
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_timer()) 
     
@@ -268,6 +294,7 @@ class IntervalTimer():
             print('waiting for DS3231 alarm')
             # loop until the DS3231 alarm is detected 
             # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
+            # e.g.  wait on asyncio event, trigger event IRQ routine
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
 
@@ -276,65 +303,63 @@ class IntervalTimer():
             ds3231.alarm(False, alarm=0)
             
             print('DS3231 alarm -> read all sensors')
-            await self.barrier_read
+            # dispatch a whole pile of activity
+            await ps.read_pm25()
+            await spec_sensors.read_all()
+            await temp_hum.read()
+            await display.display()
+            await sdcard_logger.run_logger()
+            self.event_mqtt_publish.set()
 
 class Display():
-    def __init__(self, barrier_data_ready):
-        self.barrier_data_ready = barrier_data_ready
+    def __init__(self):
         oled.fill(0)
         oled.text("Street Sense", 0, 0)
-        oled.text("Online", 0, 8)
+        oled.text("Online !", 0, 8)
         oled.show()
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_display()) 
         
-    async def run_display(self):
-        while True:
-            # wait for display data to be ready
-            await self.barrier_data_ready
-            oled.fill(0)
-            await asyncio.sleep(0)
-            oled.text("O3 v_gas {}".format(ozone.v_gas), 0, 0)
-            await asyncio.sleep(0)
-            oled.text("NO2 v_gas {}".format(no2.v_gas), 0, 8)
-            await asyncio.sleep(0)
-            oled.text("Temp {:.1f}".format(temp_hum.temp_degc), 0, 16)
-            await asyncio.sleep(0)
-            oled.text("RH {:.1f}".format(temp_hum.humid_rh), 0, 24)
-            await asyncio.sleep(0)
-            oled.show()
-            await asyncio.sleep(0)
+    async def display(self):
+        # wait for display data to be ready
+        oled.fill(0)
+        await asyncio.sleep(0)
+        oled.text("O3 ppb {}".format(spec_sensors.ozone_ppb), 0, 0)
+        await asyncio.sleep(0)
+        oled.text("NO2 ppb {}".format(spec_sensors.no2_ppb), 0, 8)
+        await asyncio.sleep(0)
+        oled.text("PM25 {}".format(ps.pm25_reading), 0, 16)
+        await asyncio.sleep(0)
+        oled.text("TdegC {}".format(temp_hum.temp_degc), 0, 24)
+        await asyncio.sleep(0)
+        oled.show()
 
 class SDCardLogger():
-    def __init__(self, barrier_data_ready):
-        self.barrier_data_ready = barrier_data_ready
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_logger()) 
+    def __init__(self):
+        pass
         
     async def run_logger(self):
-        while True:
-            s = open('/sd/samples.csv', 'a+')
-            await asyncio.sleep(0)
-            # wait until data for all sensors is available
-            await self.barrier_data_ready
-            # write sensor data to the SD Card in CSV format
-            numwrite = s.write('{}, {}, {}, {}, {:.1f}, {:.1f}\n'.format(
-                                                        sample_timestamp, 
-                                                        await ps.get_value(),
-                                                        ozone.v_gas,
-                                                        no2.v_gas,
-                                                        temp_hum.temp_degc,
-                                                        temp_hum.humid_rh))
-            print('wrote log')
-            await asyncio.sleep(0)
-            print('Logger:  s.close')
-            s.close()
-            await asyncio.sleep(0)
+        s = open('/sd/samples.csv', 'a+')
+        await asyncio.sleep(0)
+        # wait until data for all sensors is available
+        # write sensor data to the SD Card in CSV format
+        numwrite = s.write('{}, {}, {}, {}, {}, {}, {:.1f}, {:.1f}\n'.format(
+                                                    sample_timestamp, 
+                                                    ps.pm25_reading,
+                                                    spec_sensors.ozone_v_gas,
+                                                    spec_sensors.ozone_v_ref,
+                                                    spec_sensors.no2_v_gas,
+                                                    spec_sensors.no2_v_ref,
+                                                    temp_hum.temp_degc,
+                                                    temp_hum.humid_rh))
+        print('wrote log')
+        await asyncio.sleep(0)
+        print('Logger:  s.close')
+        s.close()
+        await asyncio.sleep(0)
 
 class MQTTPublish():
-    def __init__(self, barrier_data_ready):    
-        self.barrier_data_ready = barrier_data_ready
-        MQTTClient.DEBUG = True
+    def __init__(self, event_mqtt_publish):    
+        self.event_mqtt_publish = event_mqtt_publish    
+        MQTTClient.DEBUG = False
         self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'PM25'), 'utf-8')
         self.feedname_o3 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'o3'), 'utf-8')
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
@@ -350,22 +375,25 @@ class MQTTPublish():
         try:
             loop.create_task(self.run_mqtt())
         finally:
-            self.client.close()  # Prevent LmacRxBlk:1 errors    
+            self.client.close()  # Prevent LmacRxBlk:1 errors  
         
     async def run_mqtt(self):
         await self.client.connect()
         self.client.pause()
         while True:
-            await self.barrier_data_ready
+            await self.event_mqtt_publish
+            print('turn WiFi on')
             self.client.resume()
-            await self.client.publish(self.feedname_pm25, '{}'.format(await ps.get_value()), qos = 0)
-            await self.client.publish(self.feedname_o3, '{}'.format(ozone.v_gas), qos = 0)
-            await self.client.publish(self.feedname_no2, '{}'.format(no2.v_gas), qos = 0)
+            await self.client.publish(self.feedname_pm25, '{}'.format(ps.pm25_reading), qos = 0)
+            await self.client.publish(self.feedname_o3, '{}'.format(spec_sensors.ozone_ppb), qos = 0)
+            await self.client.publish(self.feedname_no2, '{}'.format(spec_sensors.no2_ppb), qos = 0)
             await self.client.publish(self.feedname_temp, '{:.1f}'.format(temp_hum.temp_degc), qos = 0)
             await self.client.publish(self.feedname_humidity, '{:.1f}'.format(temp_hum.humid_rh), qos = 0)
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
-            self.client.pause()            
+            print('turn WiFi off')
+            self.client.pause()
+            self.event_mqtt_publish.clear()
             
 class Microphone():
     def __init__(self):
@@ -376,9 +404,9 @@ class Microphone():
         # dmacount range:  2 to 128 incl
         # dmalen range:   8 to 1024 incl
         
-        bck_pin = machine.Pin(27)
-        ws_pin = machine.Pin(26)
-        sdin_pin = machine.Pin(25)
+        bck_pin = Pin(27)
+        ws_pin = Pin(26)
+        sdin_pin = Pin(25)
 
         audio=I2S(I2S.NUM0,
             bck=bck_pin,
@@ -457,48 +485,6 @@ class Microphone():
         print('Mic Stats:  overrun_count: {}, sdwrite_50_to_100ms: {}, sdwrite_over_100ms: {}, sdwrite_count:  {}'.format(overrun_count, sdwrite_50_to_100ms, sdwrite_over_100ms, sdwrite_count))
         #machine.reset()
         #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
-        
-class SpecTest():
-    def __init__(self):
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.run_spec()) 
-        
-    async def run_spec(self):
-        log_duration_in_s = 120
-        delay_ms = 500
-        # delete old logfile if it exists
-        files = uos.listdir("/sd")
-        if 'logfile.csv' in files:
-            print('removing old logfile')
-            uos.remove('/sd/logfile.csv')
-
-        log_file = open('/sd/logfile.csv', 'wt')
-        iterations = log_duration_in_s / (delay_ms * 2)
-        print('start Spec Sensor test')
-        while iterations:
-            adc.set_channel(ADS1219.CHANNEL_AIN0)
-            vref_ozone = adc.read_data()
-            await asyncio.sleep_ms(delay_ms)
-            adc.set_channel(ADS1219.CHANNEL_AIN1)
-            vgas_ozone = adc.read_data()
-            await asyncio.sleep_ms(delay_ms)
-            
-            adc.set_channel(ADS1219.CHANNEL_AIN3)
-            vref_no2 = adc.read_data()
-            await asyncio.sleep_ms(delay_ms)
-            adc.set_channel(ADS1219.CHANNEL_AIN2)
-            vgas_no2 = adc.read_data()
-            await asyncio.sleep_ms(delay_ms)
-            
-            log_string = '{}, {}, {:4.4f}, {:4.4f}, {:4.4f}, {:4.4f}\n'.format(
-                vgas_ozone, vgas_no2, vgas_ozone*2.048*1000/(2**23), vref_ozone*2.048*1000/(2**23),
-                vgas_no2*2.048*1000/(2**23), vref_no2*2.048*1000/(2**23))
-            log_file.write(log_string)
-            print(log_string)
-            iterations -= 1
-            await asyncio.sleep_ms(delay_ms)
-        log_file.close()   
-        print('end Spec Sensor test')
   
 async def idle():
     while True:
@@ -506,17 +492,8 @@ async def idle():
         utime.sleep_us(1)
         #print(gc.mem_free())
 
-  
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
-#
-
-#
-#  TODO add MQTT sensor data push to either Thingspeak or Adafruit IO
-#     
-
-# 
-# TODO add temperature/humidity sensor
 #
 
 #
@@ -529,14 +506,10 @@ else:
     gc.threshold(GC_THRESHOLD)  
               
 logging.basicConfig(level=logging.DEBUG)
-i2c = machine.I2C(scl=machine.Pin(22), sda=machine.Pin(21))
+i2c = I2C(scl=Pin(22), sda=Pin(21))
 ds3231 = urtc.DS3231(i2c, address=0x68)
 oled = ssd1306.SSD1306_I2C(128, 32, i2c)
 adc = ADS1219(i2c, address=0x41)
-adc.set_conversion_mode(ADS1219.CM_SINGLE)
-adc.set_gain(ADS1219.GAIN_1X)
-adc.set_data_rate(ADS1219.DR_20_SPS)
-adc.set_vref(ADS1219.VREF_INTERNAL)
 temp_humid_sensor = si7021.Si7021(i2c)
 
 sample_timestamp = None  #  TODO implement without using a global
@@ -556,23 +529,16 @@ mount = uos.mountsd()
 
 loop = asyncio.get_event_loop(ioq_len=2)
 lock = asyn.Lock()
-event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS) 
+event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS)
+event_mqtt_publish = asyn.Event() 
 
-# TODO investigate making use of Barriers easier for a reader to understand
-barrier_read_all_sensors = asyn.Barrier(5)   
-barrier_sensor_data_ready = asyn.Barrier(7)
-ozone = OzoneSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
-no2 = NO2Sensor(barrier_read_all_sensors, barrier_sensor_data_ready)
-temp_hum = THSensor(barrier_read_all_sensors, barrier_sensor_data_ready)
-ps = ParticulateSensor(lock, 
-                       barrier_read_all_sensors, 
-                       barrier_sensor_data_ready, 
-                       event_new_pm25_data)
-display = Display(barrier_sensor_data_ready)
-interval_timer = IntervalTimer(barrier_read_all_sensors)
-sdcard_logger = SDCardLogger(barrier_sensor_data_ready)
+spec_sensors = SpecSensors()
+temp_hum = THSensor()
+ps = ParticulateSensor(lock, event_new_pm25_data)
+display = Display()
+interval_timer = IntervalTimer(event_mqtt_publish)
+sdcard_logger = SDCardLogger()
 mic = Microphone()
-mqtt = MQTTPublish(barrier_sensor_data_ready)
-#spec_sensor_testing = SpecTest()
+mqtt = MQTTPublish(event_mqtt_publish)
 loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
 loop.run_forever()

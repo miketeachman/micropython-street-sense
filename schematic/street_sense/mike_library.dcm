@@ -5,6 +5,12 @@ D 24-bit ADC
 K adc I2C
 $ENDCMP
 #
+$CMP RT9170-3.3
+D 300mA CMOS LDO Regulator with 15μA Quiescent Current
+K linear regulator ldo fixed positive
+F https://www.richtek.com/assets/product_file/RT9170/DS9170-14.pdf
+$ENDCMP
+#
 $CMP Si7021_Module
 D Adafruit Si7021 Temperature & Humidity Sensor Breakout Board
 K I2C Humidity Temperature Sensor
