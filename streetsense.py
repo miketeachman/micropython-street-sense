@@ -22,21 +22,27 @@ from mqtt_as import MQTTClient
 from mqtt_config import mqtt_config
 import uasyncio as asyncio
 import asyn
+from aswitch import Pushbutton
 import ms_timer
 import logging
 from ads1219 import ADS1219
-import ssd1306
+import display
+
 import pms5003
 import urtc
 import si7021
 from bitcrusher import bitcrusher
 
-#    SPI Device
+#    SPI Devices
 #    - micro SD Card
+#    - ILI9340 display
 # 
 #    SPI Connections
 #    Pin   Function
-#    4     CS
+#    4     CS (SD card)
+#    12    CS (display)
+#    13    DC (display)
+#    2     LED (display)
 #    18    SCK
 #    19    MISO
 #    23    MOSI
@@ -53,9 +59,11 @@ from bitcrusher import bitcrusher
 #    Pin   Function
 #    14    Pwr on/off
 #
+#    ILI9340 Display
+#    Pin   Function
+#    
 
 #    I2C Devices
-#    - SSD1306 OLED Display
 #    - DS3231 Real Time Clock
 #    - ADS1219 24-bit ADC
 #    
@@ -76,6 +84,10 @@ from bitcrusher import bitcrusher
 #    ADS1219 ADC
 #    Pin   Function
 #    34    DRDY
+#
+#    Buttons
+#    Pin   Function
+#    15    Next Screen
 
 LOGGING_INTERVAL_IN_SECS = 60.0*2
 
@@ -83,7 +95,7 @@ NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60*1
+RECORD_TIME_IN_SECONDS = 60*60
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -135,12 +147,12 @@ class SpecSensors():
         adc.set_data_rate(ADS1219.DR_20_SPS)
         adc.set_vref(ADS1219.VREF_INTERNAL)
         self.drdy_pin = Pin(34, mode=Pin.IN, trigger=Pin.IRQ_DISABLE, handler=self.callback)        
-        self.ozone_v_gas = None
-        self.ozone_v_ref = None
-        self.ozone_ppb = None
-        self.no2_v_gas = None        
-        self.no2_v_ref = None
-        self.no2_ppb = None        
+        self.ozone_v_gas = 0
+        self.ozone_v_ref = 0
+        self.ozone_ppb = 0
+        self.no2_v_gas = 0        
+        self.no2_v_ref = 0
+        self.no2_ppb = 0        
         
     def callback(self, arg):
         if self.sample_count < self.SAMPLES_TO_CAPTURE:
@@ -196,8 +208,8 @@ class SpecSensors():
         
 class THSensor():
     def __init__(self):
-        self.temp_degc = None
-        self.humid_rh = None        
+        self.temp_degc = 0
+        self.humid_rh = 0        
         
     async def read(self):
         self.temp_degc = temp_humid_sensor.temperature
@@ -209,14 +221,18 @@ class ParticulateSensor():
                  event_new_pm25_data):
         self.lock = lock
         self.event_new_pm25_data = event_new_pm25_data
-        self.pm25_reading = None
+        self.pm25_reading = 0
+        self.pm25_pwr_pin = Pin(14, Pin.OUT)
+        self.pm25_pwr_pin.value(0)
+        # TODO power down particulate sensor on startup
         
     async def read_pm25(self):
         pm25_pwr_pin = Pin(14, Pin.OUT)
 
         print('PM2.5:  power-up')
-        pm25_pwr_pin.value(1)
+        self.pm25_pwr_pin.value(1)
         print('PM2.5:  30s warm-up')
+        # TODO check results with <30s warmup period
         await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
 
         # reinitialize the UART as means have the GPIO pins
@@ -262,7 +278,7 @@ class ParticulateSensor():
         Pin(33, Pin.IN, Pin.PULL_DOWN)
         
         print('PM2.5:  power-down')
-        pm25_pwr_pin.value(0)
+        self.pm25_pwr_pin.value(0)
         
     async def get_value(self):
         return self.pm25.pm25_env
@@ -307,31 +323,82 @@ class IntervalTimer():
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
-            await display.display()
+            await display.show_measurement_screen()
             await sdcard_logger.run_logger()
             self.event_mqtt_publish.set()
 
 class Display():
     def __init__(self):
-        oled.fill(0)
-        oled.text("Street Sense", 0, 0)
-        oled.text("Online !", 0, 8)
-        oled.show()
+        self.tft = display.TFT()
+        self.screens = [self.show_splash_screen, self.show_measurement_screen, self.show_audio_screen, self.show_diag_screen]
+        pin_screen = Pin(15, Pin.IN, Pin.PULL_UP)
+        pb_screen = Pushbutton(pin_screen)
+        pb_screen.press_func(self.next_screen)
+        self.active_screen = 0
+        self.diag_count = 0
+        backlight_ctrl = Pin(2, Pin.OUT)
+        backlight_ctrl.value(1)
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.run_diag_display()) 
         
-    async def display(self):
-        # wait for display data to be ready
-        oled.fill(0)
+    # TODO power save mode:
+    # - after a timeout, turn backlight off, and send cmd to put display to sleep
+        
+    async def run_diag_display(self):
+        self.tft.init(self.tft.ILI9341, width=240, height=320, miso=19, mosi=23, clk=18, cs=12, dc=13)
+        self.tft.orient(self.tft.LANDSCAPE_FLIP)
+        await self.show_splash_screen()
+        while True:
+            if self.active_screen == 3:  # TODO fix this hack
+                await self.show_diag_screen()
+                
+            self.diag_count += 1               
+            await asyncio.sleep_ms(500)                  
+        
+    async def next_screen(self):
+        #  TODO:  add semaphore lock around display update
+        next_screen = (self.active_screen + 1) % len(self.screens)
+        await self.screens[next_screen]()
+        self.active_screen = next_screen
+        
+    async def show_splash_screen(self):
+        self.tft.clearwin()
+        self.tft.font("fonts/Grotesk24x48.fon")
+        self.tft.text(self.tft.CENTER, self.tft.CENTER, "Street Sense", color=self.tft.CYAN)
         await asyncio.sleep(0)
-        oled.text("O3 ppb {}".format(spec_sensors.ozone_ppb), 0, 0)
+        
+    async def show_measurement_screen(self): 
+        self.tft.clearwin()  
         await asyncio.sleep(0)
-        oled.text("NO2 ppb {}".format(spec_sensors.no2_ppb), 0, 8)
+        self.tft.font(self.tft.FONT_Ubuntu)      
         await asyncio.sleep(0)
-        oled.text("PM25 {}".format(ps.pm25_reading), 0, 16)
+        self.tft.text(0, 0, "O3 ppb  {:.1f}".format(spec_sensors.ozone_ppb), color=self.tft.CYAN)
         await asyncio.sleep(0)
-        oled.text("TdegC {}".format(temp_hum.temp_degc), 0, 24)
+        self.tft.text(0, 20, "NO2 ppb {:.1f}".format(spec_sensors.no2_ppb), color=self.tft.CYAN)
         await asyncio.sleep(0)
-        oled.show()
-
+        self.tft.text(0, 40, "PM25    {:.1f}".format(ps.pm25_reading), color=self.tft.CYAN)
+        await asyncio.sleep(0)
+        self.tft.text(0, 60, "TdegC   {:.1f}".format(temp_hum.temp_degc), color=self.tft.CYAN)
+        await asyncio.sleep(0)
+        self.tft.text(0, 80, "RHum    {:.1f}".format(temp_hum.humid_rh), color=self.tft.CYAN)
+        await asyncio.sleep(0)        
+        
+    async def show_audio_screen(self):  
+        self.tft.clearwin()
+        await asyncio.sleep(0)
+        self.tft.text(0, 0, "Audio Screen", color=self.tft.CYAN)
+        await asyncio.sleep(0)
+        self.tft.text(0, 20, "... coming soon", color=self.tft.CYAN)
+        
+    async def show_diag_screen(self):  
+        self.tft.clearwin()
+        await asyncio.sleep(0)
+        self.tft.text(0, 0, "Diag Screen ...", color=self.tft.CYAN)
+        await asyncio.sleep(0)
+        self.tft.text(0, 20, "Count = {}".format(self.diag_count), color=self.tft.CYAN)
+        await asyncio.sleep(0)
+        self.tft.text(0, 40, "Wifi: {}".format(mqtt.wifi_status), color=self.tft.CYAN)        
+        
 class SDCardLogger():
     def __init__(self):
         pass
@@ -365,12 +432,14 @@ class MQTTPublish():
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
         self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'TdegC'), 'utf-8')
         self.feedname_humidity = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'humidity'), 'utf-8')
+        self.wifi_status = 'unknown'
         
         self.client = MQTTClient(server='io.adafruit.com', 
-                                 ssid=mqtt_config['ssid'], 
+                                 ssid=mqtt_config['ssid'],
                                  wifi_pw=mqtt_config['wifi_pw'], 
                                  user=mqtt_config['user'], 
                                  password=mqtt_config['password'])
+        
         loop = asyncio.get_event_loop()
         try:
             loop.create_task(self.run_mqtt())
@@ -383,6 +452,7 @@ class MQTTPublish():
         while True:
             await self.event_mqtt_publish
             print('turn WiFi on')
+            self.wifi_status = 'on'
             self.client.resume()
             await self.client.publish(self.feedname_pm25, '{}'.format(ps.pm25_reading), qos = 0)
             await self.client.publish(self.feedname_o3, '{}'.format(spec_sensors.ozone_ppb), qos = 0)
@@ -392,6 +462,7 @@ class MQTTPublish():
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
             print('turn WiFi off')
+            self.wifi_status = 'off'
             self.client.pause()
             self.event_mqtt_publish.clear()
             
@@ -508,7 +579,7 @@ else:
 logging.basicConfig(level=logging.DEBUG)
 i2c = I2C(scl=Pin(22), sda=Pin(21))
 ds3231 = urtc.DS3231(i2c, address=0x68)
-oled = ssd1306.SSD1306_I2C(128, 32, i2c)
+tft = display.TFT()
 adc = ADS1219(i2c, address=0x41)
 temp_humid_sensor = si7021.Si7021(i2c)
 
