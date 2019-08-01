@@ -1,0 +1,3 @@
+(fp_lib_table
+  (lib (name street_sense_footprints)(type KiCad)(uri "C:/Users/Mike/Documents/micropython_projects/street sense/pcbs/street_sense_footprints")(options "")(descr ""))
+)

@@ -33,19 +33,28 @@ import urtc
 import si7021
 from bitcrusher import bitcrusher
 
+###################################
+#    GPIO Pin Allocation
+###################################
+#
 #    SPI Devices
-#    - micro SD Card
-#    - ILI9340 display
+#    - Micro SD Card
+#    - ILI9341 display
 # 
-#    SPI Connections
+#    Shared SPI Connections
 #    Pin   Function
-#    4     CS (SD card)
-#    12    CS (display)
-#    13    DC (display)
-#    2     LED (display)
 #    18    SCK
 #    19    MISO
 #    23    MOSI
+
+#    Micro SD Card
+#    4     CS
+
+#    ILI9341 Display
+#    Pin   Function
+#    22    CS
+#    21    DC
+#    2     LED backlight control
 
 #    UART Device
 #    - PMS5003 Particulate Sensor
@@ -55,39 +64,45 @@ from bitcrusher import bitcrusher
 #    32    Tx
 #    33    Rx
 #
-#    Sensor Power Control
+#    Particulate Sensor Power Control
 #    Pin   Function
-#    14    Pwr on/off
-#
-#    ILI9340 Display
-#    Pin   Function
-#    
+#    25    Pwr on/off
 
 #    I2C Devices
-#    - DS3231 Real Time Clock
-#    - ADS1219 24-bit ADC
+#    - DS3231 Real Time Clock (address = 0x68)
+#    - ADS1219 24-bit ADC (address = 0x41)
+#    - si7021 Temp/Humidity sensor (address = 0x40 )
 #    
 #    I2C Connections
 #    Pin   Function
-#    21    SDA
-#    22    SCL
+#    27    SDA
+#    26    SCL
+
+#    ADS1219 ADC
+#    Pin   Function
+#    34    DRDY
 
 #    I2S Device
 #    - INMP441 omnidirectional MEMS microphone
 #
 #    I2S Connections
 #    Pin   Function
-#    27    SCK
-#    26    WS
-#    25    SD
+#    13    SCK
+#    12    WS
+#    14    SD
 #  
-#    ADS1219 ADC
+#    Push Buttons
 #    Pin   Function
-#    34    DRDY
-#
-#    Buttons
-#    Pin   Function
-#    15    Next Screen
+#    0     Advance
+#    15    Select
+
+#    Analog Inputs
+#    35    Battery Voltage
+#    39    USB Voltage
+
+#    UNUSED GPIO PINS
+#    5
+#    36
 
 LOGGING_INTERVAL_IN_SECS = 60.0*2
 
@@ -95,7 +110,7 @@ NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60
+RECORD_TIME_IN_SECONDS = 60
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -222,13 +237,11 @@ class ParticulateSensor():
         self.lock = lock
         self.event_new_pm25_data = event_new_pm25_data
         self.pm25_reading = 0
-        self.pm25_pwr_pin = Pin(14, Pin.OUT)
+        self.pm25_pwr_pin = Pin(25, Pin.OUT)
         self.pm25_pwr_pin.value(0)
         # TODO power down particulate sensor on startup
         
     async def read_pm25(self):
-        pm25_pwr_pin = Pin(14, Pin.OUT)
-
         print('PM2.5:  power-up')
         self.pm25_pwr_pin.value(1)
         print('PM2.5:  30s warm-up')
@@ -331,7 +344,7 @@ class Display():
     def __init__(self):
         self.tft = display.TFT()
         self.screens = [self.show_splash_screen, self.show_measurement_screen, self.show_audio_screen, self.show_diag_screen]
-        pin_screen = Pin(15, Pin.IN, Pin.PULL_UP)
+        pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
         pb_screen = Pushbutton(pin_screen)
         pb_screen.press_func(self.next_screen)
         self.active_screen = 0
@@ -345,7 +358,7 @@ class Display():
     # - after a timeout, turn backlight off, and send cmd to put display to sleep
         
     async def run_diag_display(self):
-        self.tft.init(self.tft.ILI9341, width=240, height=320, miso=19, mosi=23, clk=18, cs=12, dc=13)
+        self.tft.init(self.tft.ILI9341, width=240, height=320, miso=19, mosi=23, clk=18, cs=22, dc=21)
         self.tft.orient(self.tft.LANDSCAPE_FLIP)
         await self.show_splash_screen()
         while True:
@@ -475,9 +488,9 @@ class Microphone():
         # dmacount range:  2 to 128 incl
         # dmalen range:   8 to 1024 incl
         
-        bck_pin = Pin(27)
-        ws_pin = Pin(26)
-        sdin_pin = Pin(25)
+        bck_pin = Pin(13)
+        ws_pin = Pin(12)
+        sdin_pin = Pin(14)
 
         audio=I2S(I2S.NUM0,
             bck=bck_pin,
@@ -577,7 +590,7 @@ else:
     gc.threshold(GC_THRESHOLD)  
               
 logging.basicConfig(level=logging.DEBUG)
-i2c = I2C(scl=Pin(22), sda=Pin(21))
+i2c = I2C(scl=Pin(26), sda=Pin(27))
 ds3231 = urtc.DS3231(i2c, address=0x68)
 tft = display.TFT()
 adc = ADS1219(i2c, address=0x41)

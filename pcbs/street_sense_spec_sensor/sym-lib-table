@@ -1,0 +1,3 @@
+(sym_lib_table
+  (lib (name street_sense_spec_sensor-rescue)(type Legacy)(uri ${KIPRJMOD}/street_sense_spec_sensor-rescue.lib)(options "")(descr ""))
+)

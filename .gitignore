@@ -4,6 +4,7 @@ external-modules/
 tests/
 working-releases/
 data-logs/
+schematic-OLD/
 
 # eclipse generated files
 .project

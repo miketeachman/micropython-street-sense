@@ -5,6 +5,18 @@ D 24-bit ADC
 K adc I2C
 $ENDCMP
 #
+$CMP DS3231_Module
+D Extremely Accurate I2C-Integrated RTC/TCXO/Crystal SOIC-16
+K RTC TCXO Realtime Time Clock Crystal Oscillator I2C
+F http://datasheets.maximintegrated.com/en/ds/DS3231.pdf
+$ENDCMP
+#
+$CMP Micro_SD_Card_SPI
+D Micro SD Card Socket
+K connector SD microsd
+F http://katalog.we-online.de/em/datasheet/693072010801.pdf
+$ENDCMP
+#
 $CMP RT9170-3.3
 D 300mA CMOS LDO Regulator with 15μA Quiescent Current
 K linear regulator ldo fixed positive
