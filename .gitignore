@@ -21,5 +21,8 @@ schematic/street_sense/*.xml
 schematic/street_sense/*.bak
 schematic/street_sense/*.bck
 
+pcbs/street_sense_cpu/fp-info-cache
+pcbs/street_sense_spec_sensor/fp-info-cache
+
 
 

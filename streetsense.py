@@ -110,7 +110,7 @@ NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60
+RECORD_TIME_IN_SECONDS = 60*30
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -359,7 +359,7 @@ class Display():
         
     async def run_diag_display(self):
         self.tft.init(self.tft.ILI9341, width=240, height=320, miso=19, mosi=23, clk=18, cs=22, dc=21)
-        self.tft.orient(self.tft.LANDSCAPE_FLIP)
+        self.tft.orient(self.tft.LANDSCAPE)
         await self.show_splash_screen()
         while True:
             if self.active_screen == 3:  # TODO fix this hack
