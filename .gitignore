@@ -23,6 +23,7 @@ schematic/street_sense/*.bck
 
 pcbs/street_sense_cpu/fp-info-cache
 pcbs/street_sense_spec_sensor/fp-info-cache
+pcbs/street_sense_particulate/fp-info-cache
 
 
 
