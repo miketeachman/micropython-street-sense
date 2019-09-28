@@ -15,6 +15,7 @@ from machine import I2S
 from machine import I2C
 from machine import Pin
 from machine import UART
+from machine import SDCard
 from array import array
 import uos
 import utime
@@ -26,7 +27,7 @@ from aswitch import Pushbutton
 import ms_timer
 import logging
 from ads1219 import ADS1219
-import display
+#import display
 
 import pms5003
 import urtc
@@ -110,7 +111,7 @@ NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*30
+RECORD_TIME_IN_SECONDS = 10
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -119,9 +120,6 @@ NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYT
 NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
 PM25_POLLING_DELAY_MS = 500
-
-# thresholds < 20480 will result in GC only on-demand (when allocation fails)        
-GC_THRESHOLD = 10
 
 def gen_wav_header(
     sampleRate,
@@ -161,7 +159,7 @@ class SpecSensors():
         adc.set_gain(ADS1219.GAIN_1X)
         adc.set_data_rate(ADS1219.DR_20_SPS)
         adc.set_vref(ADS1219.VREF_INTERNAL)
-        self.drdy_pin = Pin(34, mode=Pin.IN, trigger=Pin.IRQ_DISABLE, handler=self.callback)        
+        self.drdy_pin = Pin(34, mode=Pin.IN)        
         self.ozone_v_gas = 0
         self.ozone_v_ref = 0
         self.ozone_ppb = 0
@@ -174,7 +172,8 @@ class SpecSensors():
             self.sample_sum += adc.read_data_irq()
             self.sample_count += 1
             # re-enable interrupt
-            self.drdy_pin.init(trigger=Pin.IRQ_LOLEVEL)
+            #self.drdy_pin.init(trigger=Pin.IRQ_LOLEVEL)
+            self.drdy_pin.irq(trigger=Pin.IRQ_FALLING, handler=self.callback)
         
     async def read(self, adc_channel):
         print('adc_channel=', adc_channel)
@@ -190,13 +189,13 @@ class SpecSensors():
         await asyncio.sleep(1)
         print('start', utime.ticks_ms())
 
-        self.drdy_pin.init(trigger=Pin.IRQ_LOLEVEL)
+        self.drdy_pin.irq(trigger=Pin.IRQ_FALLING, handler=self.callback)
         
         while self.sample_count < self.SAMPLES_TO_CAPTURE:
             #print(self.sample_count)
             await asyncio.sleep_ms(10)
 
-        self.drdy_pin.init(trigger=Pin.IRQ_DISABLE)
+        self.drdy_pin.init()  # TBD - will this disable interrupt on pin ??
         print('done', utime.ticks_ms())
         
         adc.set_conversion_mode(ADS1219.CM_SINGLE)
@@ -267,6 +266,7 @@ class ParticulateSensor():
         print('PM2.5:  value = {}'.format(self.pm25_reading))
         self.event_new_pm25_data.clear() 
         
+        '''
         # Next section of code sets UART Tx and Rx pins as inputs with pull downs
         # This is done to make sure Tx and Rx are at zero volts
         # before the particulate sensor is powered off
@@ -287,6 +287,7 @@ class ParticulateSensor():
         else:
             self.uart.deinit_finish()
 
+        '''
         Pin(32, Pin.IN, Pin.PULL_DOWN)
         Pin(33, Pin.IN, Pin.PULL_DOWN)
         
@@ -336,7 +337,7 @@ class IntervalTimer():
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
-            await display.show_measurement_screen()
+            #await display.show_measurement_screen()
             await sdcard_logger.run_logger()
             self.event_mqtt_publish.set()
 
@@ -470,7 +471,7 @@ class MQTTPublish():
             await self.client.publish(self.feedname_pm25, '{}'.format(ps.pm25_reading), qos = 0)
             await self.client.publish(self.feedname_o3, '{}'.format(spec_sensors.ozone_ppb), qos = 0)
             await self.client.publish(self.feedname_no2, '{}'.format(spec_sensors.no2_ppb), qos = 0)
-            await self.client.publish(self.feedname_temp, '{:.1f}'.format(temp_hum.temp_degc), qos = 0)
+            await self.client.publish(self.feedname_temp, '{:.2f}'.format(temp_hum.temp_degc), qos = 0)
             await self.client.publish(self.feedname_humidity, '{:.1f}'.format(temp_hum.humid_rh), qos = 0)
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
@@ -525,7 +526,12 @@ class Microphone():
                 start_ticks_us = utime.ticks_us()
 
                 # read samples from microphone
+                t0 = utime.ticks_us()
                 numread = audio.readinto(samples, timeout=0)
+                t1 = utime.ticks_us()
+                #print((t1-t0)/1000)
+
+                #print(bytes_remaining_to_rx)
                 bytes_remaining_to_rx -= numread
                 
                 if numread == 0:
@@ -552,6 +558,7 @@ class Microphone():
                     elif (sd_write_time) > 50*1000:  # 50ms
                         sdwrite_50_to_100ms += 1
                     
+                    #print(sd_write_time/1000)
                 end_ticks_us = utime.ticks_us()
                 # TODO use ticks diff us routine
                 bytes_in_dma_memory += ((end_ticks_us - start_ticks_us) * (SAMPLES_PER_SECOND * NUM_BYTES_RX)) // 1000000
@@ -570,12 +577,6 @@ class Microphone():
         #machine.reset()
         #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
   
-async def idle():
-    while True:
-        await asyncio.sleep(2)
-        utime.sleep_us(1)
-        #print(gc.mem_free())
-
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
 #
@@ -584,15 +585,10 @@ async def idle():
 #  TODO add stretch goal:  calculate noise db from audio samples
 #
 
-if sys.platform == 'esp32_LoBo':  
-    gc.threshold(GC_THRESHOLD, 0)  #  2nd arg=1 turns on GC debug  
-else:
-    gc.threshold(GC_THRESHOLD)  
-              
 logging.basicConfig(level=logging.DEBUG)
 i2c = I2C(scl=Pin(26), sda=Pin(27))
 ds3231 = urtc.DS3231(i2c, address=0x68)
-tft = display.TFT()
+#tft = display.TFT()
 adc = ADS1219(i2c, address=0x41)
 temp_humid_sensor = si7021.Si7021(i2c)
 
@@ -601,15 +597,8 @@ pms5003.set_debug(False)
 asyncio.set_debug(0)
 asyncio.core.set_debug(0)
 
-sdconfig = uos.sdconfig(
-                        uos.SDMODE_SPI,
-                        clk=18,
-                        mosi=23,
-                        miso=19,
-                        cs=4,
-                        maxspeed=40,
-                        )
-mount = uos.mountsd()
+sd = SDCard(slot=2, sck=Pin(18), mosi=Pin(23), miso=Pin(19), cs=Pin(4))
+uos.mount(sd, "/sd")
 
 loop = asyncio.get_event_loop(ioq_len=2)
 lock = asyn.Lock()
@@ -619,10 +608,10 @@ event_mqtt_publish = asyn.Event()
 spec_sensors = SpecSensors()
 temp_hum = THSensor()
 ps = ParticulateSensor(lock, event_new_pm25_data)
-display = Display()
+#display = Display()
 interval_timer = IntervalTimer(event_mqtt_publish)
 sdcard_logger = SDCardLogger()
 mic = Microphone()
 mqtt = MQTTPublish(event_mqtt_publish)
-loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
+#loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
 loop.run_forever()
