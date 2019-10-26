@@ -1,7 +1,8 @@
 # non-project folders
 ######################
 external-modules/
-tests/
+tests-lobo/
+tests-mainline/
 working-releases/
 data-logs/
 schematic-OLD/
@@ -20,6 +21,8 @@ schematic/street_sense/*.xml
 # backup files
 schematic/street_sense/*.bak
 schematic/street_sense/*.bck
+*.kicad_pcb
+*.kicad_pcb-bak
 
 pcbs/street_sense_cpu/fp-info-cache
 pcbs/street_sense_spec_sensor/fp-info-cache

@@ -9,6 +9,7 @@
 
 import gc
 import sys
+import esp
 import math
 import machine
 from machine import I2S
@@ -27,8 +28,9 @@ from aswitch import Pushbutton
 import ms_timer
 import logging
 from ads1219 import ADS1219
-#import display
-
+import lvgl as lv
+import ILI9341 as ili
+import lvesp32
 import pms5003
 import urtc
 import si7021
@@ -105,13 +107,13 @@ from bitcrusher import bitcrusher
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60.0*2
+LOGGING_INTERVAL_IN_SECS = 60*2
 
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 
 # I2S Microphone related config
-SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 10
+SAMPLES_PER_SECOND = 20000
+RECORD_TIME_IN_SECONDS = 60*30
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -238,13 +240,11 @@ class ParticulateSensor():
         self.pm25_reading = 0
         self.pm25_pwr_pin = Pin(25, Pin.OUT)
         self.pm25_pwr_pin.value(0)
-        # TODO power down particulate sensor on startup
         
     async def read_pm25(self):
         print('PM2.5:  power-up')
         self.pm25_pwr_pin.value(1)
         print('PM2.5:  30s warm-up')
-        # TODO check results with <30s warmup period
         await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
 
         # reinitialize the UART as means have the GPIO pins
@@ -337,14 +337,13 @@ class IntervalTimer():
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
-            #await display.show_measurement_screen()
+            await display.show_measurement_screen()
             await sdcard_logger.run_logger()
             self.event_mqtt_publish.set()
 
 class Display():
     def __init__(self):
-        self.tft = display.TFT()
-        self.screens = [self.show_splash_screen, self.show_measurement_screen, self.show_audio_screen, self.show_diag_screen]
+        self.screens = [self.show_splash_screen, self.show_measurement_screen] #, self.show_audio_screen, self.show_diag_screen]
         pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
         pb_screen = Pushbutton(pin_screen)
         pb_screen.press_func(self.next_screen)
@@ -359,8 +358,23 @@ class Display():
     # - after a timeout, turn backlight off, and send cmd to put display to sleep
         
     async def run_diag_display(self):
-        self.tft.init(self.tft.ILI9341, width=240, height=320, miso=19, mosi=23, clk=18, cs=22, dc=21)
-        self.tft.orient(self.tft.LANDSCAPE)
+        # Initialize the ILI9341 driver
+        # spihost:  1=HSPI 2=VSPI
+        disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, rst=15, backlight=2, mhz=20)
+        disp.init()
+        
+        # Register display driver to LittlevGL
+        disp_buf1 = lv.disp_buf_t()
+        buf1_1 = bytearray(480*10)
+        lv.disp_buf_init(disp_buf1,buf1_1, None, len(buf1_1)//4)
+        disp_drv = lv.disp_drv_t()
+        lv.disp_drv_init(disp_drv)
+        disp_drv.buffer = disp_buf1
+        disp_drv.flush_cb = disp.flush
+        disp_drv.hor_res = 320  
+        disp_drv.ver_res = 240
+        disp_drv.rotated = 0
+        lv.disp_drv_register(disp_drv)        
         await self.show_splash_screen()
         while True:
             if self.active_screen == 3:  # TODO fix this hack
@@ -376,48 +390,173 @@ class Display():
         self.active_screen = next_screen
         
     async def show_splash_screen(self):
-        self.tft.clearwin()
-        self.tft.font("fonts/Grotesk24x48.fon")
-        self.tft.text(self.tft.CENTER, self.tft.CENTER, "Street Sense", color=self.tft.CYAN)
+        print('show splash screen')
+        #
+        # show streetsense image 
+        #
+        screen3 = lv.obj()
+        with open('street_sense_b_rgb565.bin','rb') as f:
+            img_data = f.read()
+            
+        img = lv.img(screen3)
+        img_dsc = lv.img_dsc_t({
+            'header':{
+                'always_zero': 0,
+                'w':320,
+                'h':240,
+                'cf':lv.img.CF.TRUE_COLOR
+            },
+            'data_size': len(img_data),
+            'data': img_data
+        })
+        
+        img.set_src(img_dsc)
+        
+        lv.scr_load(screen3)
+        await asyncio.sleep(2)
+        #
+        # show GVCC image 
+        #
+        screen3 = lv.obj()
+        with open('gvcc_240x240_b_rgb565.bin','rb') as f:
+            img_data = f.read()
+            
+        img = lv.img(screen3)
+        img_dsc = lv.img_dsc_t({
+            'header':{
+                'always_zero': 0,
+                'w':240,
+                'h':240,
+                'cf':lv.img.CF.TRUE_COLOR
+            },
+            'data_size': len(img_data),
+            'data': img_data
+        })
+        
+        img.set_src(img_dsc)
+        lv.scr_load(screen3)
+        
+        await asyncio.sleep(2)
+        #
+        # show GV Placemaking image 
+        #
+        screen3 = lv.obj()
+        with open('placemaking_320x96_b_rgb565.bin','rb') as f:
+            img_data = f.read()
+            
+        img = lv.img(screen3)
+        img_dsc = lv.img_dsc_t({
+            'header':{
+                'always_zero': 0,
+                'w':320,
+                'h':96,
+                'cf':lv.img.CF.TRUE_COLOR
+            },
+            'data_size': len(img_data),
+            'data': img_data
+        })
+        
+        img.set_src(img_dsc)
+        lv.scr_load(screen3)        
+        
         await asyncio.sleep(0)
         
     async def show_measurement_screen(self): 
-        self.tft.clearwin()  
+        # 
+        # Measurement screen using a table
+        #
+        #
+        # lv.table.STYLE.CELL1 = normal cell
+        # lv.table.STYLE.CELL2 = header cell
+        # lv.table.STYLE.CELL3 = ?
+        # lv.table.STYLE.CELL4 = ?
+        measurement_screen = lv.obj()
+        
+        # set background color, with no gradient
+        screenstyle = lv.style_t(lv.style_plain)
+        #screenstyle.body.main_color = lv.color_make(0xFF, 0xA5, 0x00)
+        # 0xFF, 0x00, 0x00  Red
+        # 0xC0, 0xC0, 0xC0  Silver
+        # 0xFF, 0xA5, 0x00  Orange
+        #screenstyle.body.grad_color = lv.color_make(0xFF, 0xA5, 0x00)
+        screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        screenstyle.body.border.width = 5
+        measurement_screen.set_style(screenstyle)
+        
+        tablestyle = lv.style_t(lv.style_plain)
+        tablestyle.body.border.width = 0
+        tablestyle.body.opa = 0
+        
+        cellstyle = lv.style_t(lv.style_plain)
+        cellstyle.text.color = lv.color_hex(0xa028d4)
+        cellstyle.text.font = lv.font_roboto_28
+        cellstyle.body.padding.top = 1
+        cellstyle.body.padding.bottom = 1
+        cellstyle.body.border.width = 0
+        cellstyle.body.opa = 0
+        
+        mtable = lv.table(measurement_screen)
+        mtable.set_row_cnt(6)
+        mtable.set_col_cnt(3)
+        mtable.set_col_width(0, 110)
+        mtable.set_col_width(1, 100)
+        mtable.set_col_width(2, 100)
+        mtable.set_style(lv.table.STYLE.BG, tablestyle)
+        mtable.set_style(lv.table.STYLE.CELL1, cellstyle)
+        
+        mtable.set_cell_value(0,0, "NO2")
+        mtable.set_cell_value(1,0, "O3")
+        mtable.set_cell_value(2,0, "PM2.5")
+        mtable.set_cell_value(3,0, "Temp")
+        mtable.set_cell_value(4,0, "RH")
+        mtable.set_cell_value(5,0, "Noise")
+        
+        mtable.set_cell_value(0,1, '{:.1f}'.format(spec_sensors.no2_ppb))
+        mtable.set_cell_value(1,1, '{:.1f}'.format(spec_sensors.ozone_ppb))
+        mtable.set_cell_value(2,1, '{:.1f}'.format(ps.pm25_reading))
+        mtable.set_cell_value(3,1, '{:.1f}'.format(temp_hum.temp_degc))
+        mtable.set_cell_value(4,1, '{:.1f}'.format(temp_hum.humid_rh))
+        mtable.set_cell_value(5,1, "N/A")
+        
+        mtable.set_cell_value(0,2, "ppb")
+        mtable.set_cell_value(1,2, "ppb")
+        mtable.set_cell_value(2,2, "ug/m3")
+        mtable.set_cell_value(3,2, "degC")
+        mtable.set_cell_value(4,2, "%")
+        mtable.set_cell_value(5,2, "db")
+        
+        lv.scr_load(measurement_screen)
         await asyncio.sleep(0)
-        self.tft.font(self.tft.FONT_Ubuntu)      
-        await asyncio.sleep(0)
-        self.tft.text(0, 0, "O3 ppb  {:.1f}".format(spec_sensors.ozone_ppb), color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 20, "NO2 ppb {:.1f}".format(spec_sensors.no2_ppb), color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 40, "PM25    {:.1f}".format(ps.pm25_reading), color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 60, "TdegC   {:.1f}".format(temp_hum.temp_degc), color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 80, "RHum    {:.1f}".format(temp_hum.humid_rh), color=self.tft.CYAN)
-        await asyncio.sleep(0)        
         
     async def show_audio_screen(self):  
+        '''
         self.tft.clearwin()
         await asyncio.sleep(0)
         self.tft.text(0, 0, "Audio Screen", color=self.tft.CYAN)
         await asyncio.sleep(0)
         self.tft.text(0, 20, "... coming soon", color=self.tft.CYAN)
+        '''
+        pass
         
     async def show_diag_screen(self):  
+        '''
         self.tft.clearwin()
         await asyncio.sleep(0)
         self.tft.text(0, 0, "Diag Screen ...", color=self.tft.CYAN)
         await asyncio.sleep(0)
         self.tft.text(0, 20, "Count = {}".format(self.diag_count), color=self.tft.CYAN)
         await asyncio.sleep(0)
-        self.tft.text(0, 40, "Wifi: {}".format(mqtt.wifi_status), color=self.tft.CYAN)        
+        self.tft.text(0, 40, "Wifi: {}".format(mqtt.wifi_status), color=self.tft.CYAN) 
+        '''
+        pass       
         
 class SDCardLogger():
     def __init__(self):
         pass
         
     async def run_logger(self):
+        print('SDCardLogger:  waiting for SD Card Init')
+        print('SDCardLogger:  opening file')
         s = open('/sd/samples.csv', 'a+')
         await asyncio.sleep(0)
         # wait until data for all sensors is available
@@ -505,9 +644,12 @@ class Microphone():
             dmacount=64,
             dmalen=256)
         timer_ms = ms_timer.MillisecTimer()
+                
+        print('Mic: opening WAV file')
         m=open('/sd/upy.wav','wb')
         wav_header = gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
                             SAMPLES_PER_SECOND * RECORD_TIME_IN_SECONDS)
+        print('write WAV header')
         m.write(wav_header)
         numread = 0
         numwrite = 0
@@ -547,7 +689,6 @@ class Microphone():
                 
                     # write samples to SD Card
                     start_sd_write = utime.ticks_us()
-                    #utime.sleep_us(3000)
                     numwrite = m.write(sd_sector)
                     end_sd_write = utime.ticks_us()
                     sdwrite_count += 1
@@ -588,30 +729,33 @@ class Microphone():
 logging.basicConfig(level=logging.DEBUG)
 i2c = I2C(scl=Pin(26), sda=Pin(27))
 ds3231 = urtc.DS3231(i2c, address=0x68)
-#tft = display.TFT()
 adc = ADS1219(i2c, address=0x41)
 temp_humid_sensor = si7021.Si7021(i2c)
 
 sample_timestamp = None  #  TODO implement without using a global
+esp.osdebug(esp.LOG_ERROR)
 pms5003.set_debug(False)
 asyncio.set_debug(0)
 asyncio.core.set_debug(0)
 
-sd = SDCard(slot=2, sck=Pin(18), mosi=Pin(23), miso=Pin(19), cs=Pin(4))
+# slot=2 configures SD Card to use the SPI3 controller (VSPI), DMA channel = 2
+# slot=3 configures SD Card to use the SPI2 controller (HSPI), DMA channel = 1
+sd = SDCard(slot=3, sck=Pin(18), mosi=Pin(23), miso=Pin(19), cs=Pin(4))
+# TODO figure out the root cause of the intermittent problem 0x109 error that happens on mounting the SD Card
+utime.sleep(2) # workaround for 0x109 error (CRC error) that sometimes happens in the following mount call 
 uos.mount(sd, "/sd")
 
 loop = asyncio.get_event_loop(ioq_len=2)
 lock = asyn.Lock()
 event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS)
-event_mqtt_publish = asyn.Event() 
+event_mqtt_publish = asyn.Event()
 
 spec_sensors = SpecSensors()
 temp_hum = THSensor()
 ps = ParticulateSensor(lock, event_new_pm25_data)
-#display = Display()
+display = Display()
 interval_timer = IntervalTimer(event_mqtt_publish)
 sdcard_logger = SDCardLogger()
 mic = Microphone()
 mqtt = MQTTPublish(event_mqtt_publish)
-#loop.create_task(idle())  # workaround for watchdog trigger issue in LoBo port
 loop.run_forever()
