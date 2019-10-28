@@ -17,6 +17,7 @@ from machine import I2C
 from machine import Pin
 from machine import UART
 from machine import SDCard
+from machine import ADC
 from array import array
 import uos
 import utime
@@ -100,8 +101,8 @@ from bitcrusher import bitcrusher
 #    15    Select
 
 #    Analog Inputs
-#    35    Battery Voltage
-#    39    USB Voltage
+#    35    Battery Voltage. Resistive divider on Lolin board: BAT-100k-Pin35-100k-GND
+#    39    USB Voltage. Resistive divider:  USB-68k-Pin39-100k-GND
 
 #    UNUSED GPIO PINS
 #    5
@@ -343,7 +344,7 @@ class IntervalTimer():
 
 class Display():
     def __init__(self):
-        self.screens = [self.show_splash_screen, self.show_measurement_screen] #, self.show_audio_screen, self.show_diag_screen]
+        self.screens = [self.show_measurement_screen, self.show_voltage_monitor_screen]
         pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
         pb_screen = Pushbutton(pin_screen)
         pb_screen.press_func(self.next_screen)
@@ -364,6 +365,7 @@ class Display():
         disp.init()
         
         # Register display driver to LittlevGL
+        # ... start boilerplate magic
         disp_buf1 = lv.disp_buf_t()
         buf1_1 = bytearray(480*10)
         lv.disp_buf_init(disp_buf1,buf1_1, None, len(buf1_1)//4)
@@ -374,17 +376,15 @@ class Display():
         disp_drv.hor_res = 320  
         disp_drv.ver_res = 240
         disp_drv.rotated = 0
-        lv.disp_drv_register(disp_drv)        
+        lv.disp_drv_register(disp_drv)  
+        # ... end boilerplate magic   
+                   
         await self.show_splash_screen()
+        await self.screens[self.active_screen]()
         while True:
-            if self.active_screen == 3:  # TODO fix this hack
-                await self.show_diag_screen()
-                
-            self.diag_count += 1               
-            await asyncio.sleep_ms(500)                  
+            await asyncio.sleep(1)                  
         
     async def next_screen(self):
-        #  TODO:  add semaphore lock around display update
         next_screen = (self.active_screen + 1) % len(self.screens)
         await self.screens[next_screen]()
         self.active_screen = next_screen
@@ -413,7 +413,7 @@ class Display():
         img.set_src(img_dsc)
         
         lv.scr_load(screen3)
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         #
         # show GVCC image 
         #
@@ -422,6 +422,7 @@ class Display():
             img_data = f.read()
             
         img = lv.img(screen3)
+        img.set_x(40)  # center image by moving over 40px
         img_dsc = lv.img_dsc_t({
             'header':{
                 'always_zero': 0,
@@ -436,7 +437,7 @@ class Display():
         img.set_src(img_dsc)
         lv.scr_load(screen3)
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         #
         # show GV Placemaking image 
         #
@@ -527,6 +528,60 @@ class Display():
         
         lv.scr_load(measurement_screen)
         await asyncio.sleep(0)
+        
+    async def show_voltage_monitor_screen(self): 
+        # 
+        # Measurement screen using a table
+        #
+        #
+        # lv.table.STYLE.CELL1 = normal cell
+        # lv.table.STYLE.CELL2 = header cell
+        # lv.table.STYLE.CELL3 = ?
+        # lv.table.STYLE.CELL4 = ?
+        voltage_screen = lv.obj()
+        
+        # set background color, with no gradient
+        screenstyle = lv.style_t(lv.style_plain)
+        #screenstyle.body.main_color = lv.color_make(0xFF, 0xA5, 0x00)
+        # 0xFF, 0x00, 0x00  Red
+        # 0xC0, 0xC0, 0xC0  Silver
+        # 0xFF, 0xA5, 0x00  Orange
+        #screenstyle.body.grad_color = lv.color_make(0xFF, 0xA5, 0x00)
+        screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        screenstyle.body.border.width = 5
+        voltage_screen.set_style(screenstyle)
+        
+        tablestyle = lv.style_t(lv.style_plain)
+        tablestyle.body.border.width = 0
+        tablestyle.body.opa = 0
+        
+        cellstyle = lv.style_t(lv.style_plain)
+        cellstyle.text.color = lv.color_hex(0xa028d4)
+        cellstyle.text.font = lv.font_roboto_28
+        cellstyle.body.padding.top = 1
+        cellstyle.body.padding.bottom = 1
+        cellstyle.body.border.width = 0
+        cellstyle.body.opa = 0
+        
+        mtable = lv.table(voltage_screen)
+        mtable.set_row_cnt(2)
+        mtable.set_col_cnt(3)
+        mtable.set_col_width(0, 110)
+        mtable.set_col_width(1, 100)
+        mtable.set_col_width(2, 100)
+        mtable.set_style(lv.table.STYLE.BG, tablestyle)
+        mtable.set_style(lv.table.STYLE.CELL1, cellstyle)
+        
+        mtable.set_cell_value(0,0, "V_BAT")
+        mtable.set_cell_value(1,0, "V_USB")
+        
+        mtable.set_cell_value(0,1, '{:.2f}'.format(voltage_monitor.v_bat))
+        mtable.set_cell_value(1,1, '{:.2f}'.format(voltage_monitor.v_usb))
+        
+        mtable.set_cell_value(0,2, "V")
+        mtable.set_cell_value(1,2, "V")
+        
+        lv.scr_load(voltage_screen)
         
     async def show_audio_screen(self):  
         '''
@@ -718,6 +773,36 @@ class Microphone():
         #machine.reset()
         #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
   
+class VoltageMonitor():
+    def __init__(self):
+        self.v_bat = 0
+        self.v_usb = 0
+        self.vbat_pin = ADC(Pin(35))
+        self.vbat_pin.atten(ADC.ATTN_11DB)
+        self.vbat_pin.width(ADC.WIDTH_12BIT)
+        self.vusb_pin = ADC(Pin(39))
+        self.vusb_pin.atten(ADC.ATTN_11DB)
+        self.vusb_pin.width(ADC.WIDTH_12BIT)
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.run_v_monitor()) 
+                
+    async def run_v_monitor(self):
+        v_bat_sample_sum = 0
+        v_usb_sample_sum = 0
+        
+        while True:
+            # average 20 readings
+            for _ in range(20):
+                v_bat_sample_sum += self.vbat_pin.read()
+                v_usb_sample_sum += self.vusb_pin.read()
+                await asyncio.sleep_ms(50)
+                
+            self.v_bat = v_bat_sample_sum * 0.001757 / 20 
+            self.v_usb = v_usb_sample_sum * 0.001419 / 20
+            v_bat_sample_sum = 0
+            v_usb_sample_sum = 0
+
+  
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
 #
@@ -758,4 +843,5 @@ interval_timer = IntervalTimer(event_mqtt_publish)
 sdcard_logger = SDCardLogger()
 mic = Microphone()
 mqtt = MQTTPublish(event_mqtt_publish)
+voltage_monitor = VoltageMonitor()
 loop.run_forever()
