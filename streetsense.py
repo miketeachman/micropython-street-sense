@@ -35,7 +35,10 @@ import lvesp32
 import pms5003
 import urtc
 import si7021
-from bitcrusher import bitcrusher
+import i2stools
+import dba
+#import fft
+#import ustruct
 
 ###################################
 #    GPIO Pin Allocation
@@ -110,20 +113,21 @@ from bitcrusher import bitcrusher
 
 LOGGING_INTERVAL_IN_SECS = 60*2
 
-NUM_BYTES_IN_SDCARD_SECTOR = 512
-
+#  TODO clean this up...confusing, complicated
 # I2S Microphone related config
-SAMPLES_PER_SECOND = 20000
-RECORD_TIME_IN_SECONDS = 60*30
+SAMPLES_PER_SECOND = 10000
+RECORD_TIME_IN_SECONDS = 120
 NUM_BYTES_RX = 8
-NUM_BYTES_USED = 2
+NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
+NUM_BYTES_IN_SDCARD_SECTOR = 512
 NUM_BYTES_IN_SAMPLE_BLOCK = NUM_BYTES_IN_SDCARD_SECTOR * (NUM_BYTES_RX // NUM_BYTES_USED)
 NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_USED)
 NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
 PM25_POLLING_DELAY_MS = 500
 
+# TODO put this function into a file
 def gen_wav_header(
     sampleRate,
     bitsPerSample,
@@ -247,11 +251,6 @@ class ParticulateSensor():
         self.pm25_pwr_pin.value(1)
         print('PM2.5:  30s warm-up')
         await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
-
-        # reinitialize the UART as means have the GPIO pins
-        # working as Tx and Rx 
-        # note:  reinitialize PMS5003 sensor so the new UART object is 
-        #        associated with the PMS5003 object
         self.uart = UART(1, tx=32, rx=33, baudrate=9600)
         self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
         await asyncio.sleep(1)
@@ -266,32 +265,8 @@ class ParticulateSensor():
         self.pm25_reading = await ps.get_value()
         print('PM2.5:  value = {}'.format(self.pm25_reading))
         self.event_new_pm25_data.clear() 
-        
-        '''
-        # Next section of code sets UART Tx and Rx pins as inputs with pull downs
-        # This is done to make sure Tx and Rx are at zero volts
-        # before the particulate sensor is powered off
-        # A non-obvious sequence of events is needed to achieve this:
-        # 1. deinit_start():  flags the UART task to stop running
-        # 2. test UART task in a non-blocking wait loop until it stops
-        # 3. deinit_finish():  final steps to terminate the UART task
-        # 4. set Tx and Rx pins as pulled-down inputs
-        # 5. power down the particulate sensor
-        self.uart.deinit_start()
-        iter = 50
-        while iter and self.uart.is_task_running():
-            await asyncio.sleep_ms(100)
-            iter -= 1
-            
-        if not iter:
-            raise ValueError('could not stop UART task')
-        else:
-            self.uart.deinit_finish()
-
-        '''
         Pin(32, Pin.IN, Pin.PULL_DOWN)
         Pin(33, Pin.IN, Pin.PULL_DOWN)
-        
         print('PM2.5:  power-down')
         self.pm25_pwr_pin.value(0)
         
@@ -311,7 +286,8 @@ class IntervalTimer():
             time_now = urtc.tuple2seconds(ds3231.datetime())
             # calculate the next alarm time, aligned to the desired interval
             # e.g.  interval=15mins ==>  align to 00, 15, 30, 45 mins
-            time_now += 5  # to eliminate risk of timing hazard close to interval boundary
+            # TODO improve the first-time calc of wake_time ... missed starting about 10% of the time
+            time_now += 10  # to eliminate risk of timing hazard close to interval boundary
             wake_time = int(math.ceil(time_now / LOGGING_INTERVAL_IN_SECS) * LOGGING_INTERVAL_IN_SECS)
             
             # set day-of-week (4th element) to None so alarm uses day-of-month (urtc module API requirement)
@@ -324,8 +300,6 @@ class IntervalTimer():
             print('next sensor read at {}'.format(wake_time_list))
             print('waiting for DS3231 alarm')
             # loop until the DS3231 alarm is detected 
-            # TODO consider use of DS3231 hardware alarm pin, with ESP32 interrupt
-            # e.g.  wait on asyncio event, trigger event IRQ routine
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
 
@@ -338,34 +312,34 @@ class IntervalTimer():
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
-            await display.show_measurement_screen()
             await sdcard_logger.run_logger()
             self.event_mqtt_publish.set()
 
 class Display():
     def __init__(self):
-        self.screens = [self.show_measurement_screen, self.show_voltage_monitor_screen]
+        self.screens = [self.show_measurement_screen, self.show_voltage_monitor_screen, self.show_display_sleep_screen]
         pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
         pb_screen = Pushbutton(pin_screen)
         pb_screen.press_func(self.next_screen)
-        self.active_screen = 0
+        self.active_screen = 1  # TODO make some sort of datastructure for screens + screen ids
+        self.next_screen = 0 # show the measurement screen first TODO this is a clunky way to show this after measurement screen
         self.diag_count = 0
-        backlight_ctrl = Pin(2, Pin.OUT)
-        backlight_ctrl.value(1)
+        self.backlight_ctrl = Pin(2, Pin.OUT)
+        self.backlight_ctrl.value(1)
         loop = asyncio.get_event_loop()
-        loop.create_task(self.run_diag_display()) 
+        loop.create_task(self.run_display()) 
         
     # TODO power save mode:
     # - after a timeout, turn backlight off, and send cmd to put display to sleep
         
-    async def run_diag_display(self):
+    async def run_display(self):
         # Initialize the ILI9341 driver
         # spihost:  1=HSPI 2=VSPI
         disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, rst=15, backlight=2, mhz=20)
         disp.init()
         
         # Register display driver to LittlevGL
-        # ... start boilerplate magic
+        # ... Start boilerplate magic
         disp_buf1 = lv.disp_buf_t()
         buf1_1 = bytearray(480*10)
         lv.disp_buf_init(disp_buf1,buf1_1, None, len(buf1_1)//4)
@@ -377,28 +351,31 @@ class Display():
         disp_drv.ver_res = 240
         disp_drv.rotated = 0
         lv.disp_drv_register(disp_drv)  
-        # ... end boilerplate magic   
+        # ... End boilerplate magic   
                    
-        await self.show_splash_screen()
-        await self.screens[self.active_screen]()
+        await self.show_welcome_screens()
+        
+        # continually refresh the active screen
+        # detect screen change coming from a button press
         while True:
-            await asyncio.sleep(1)                  
+            if (self.next_screen != self.active_screen):
+                self.active_screen = self.next_screen
+            await self.screens[self.active_screen]()
+            await asyncio.sleep(2)  # TODO idea:  each screen might have a configurable update time                  
         
+    # following function is called when the screen advance button is pressed
     async def next_screen(self):
-        next_screen = (self.active_screen + 1) % len(self.screens)
-        await self.screens[next_screen]()
-        self.active_screen = next_screen
+        self.next_screen = (self.active_screen + 1) % len(self.screens)
         
-    async def show_splash_screen(self):
-        print('show splash screen')
+    async def show_welcome_screens(self):
         #
-        # show streetsense image 
+        # show Street Sense image 
         #
-        screen3 = lv.obj()
+        welcome_screen1 = lv.obj()
         with open('street_sense_b_rgb565.bin','rb') as f:
             img_data = f.read()
             
-        img = lv.img(screen3)
+        img = lv.img(welcome_screen1)
         img_dsc = lv.img_dsc_t({
             'header':{
                 'always_zero': 0,
@@ -412,16 +389,16 @@ class Display():
         
         img.set_src(img_dsc)
         
-        lv.scr_load(screen3)
+        lv.scr_load(welcome_screen1)
         await asyncio.sleep(1)
         #
         # show GVCC image 
         #
-        screen3 = lv.obj()
+        welcome_screen2 = lv.obj()
         with open('gvcc_240x240_b_rgb565.bin','rb') as f:
             img_data = f.read()
             
-        img = lv.img(screen3)
+        img = lv.img(welcome_screen2)
         img.set_x(40)  # center image by moving over 40px
         img_dsc = lv.img_dsc_t({
             'header':{
@@ -435,17 +412,17 @@ class Display():
         })
         
         img.set_src(img_dsc)
-        lv.scr_load(screen3)
+        lv.scr_load(welcome_screen2)
         
         await asyncio.sleep(1)
         #
         # show GV Placemaking image 
         #
-        screen3 = lv.obj()
+        welcome_screen3 = lv.obj()
         with open('placemaking_320x96_b_rgb565.bin','rb') as f:
             img_data = f.read()
             
-        img = lv.img(screen3)
+        img = lv.img(welcome_screen3)
         img_dsc = lv.img_dsc_t({
             'header':{
                 'always_zero': 0,
@@ -458,11 +435,10 @@ class Display():
         })
         
         img.set_src(img_dsc)
-        lv.scr_load(screen3)        
+        lv.scr_load(welcome_screen3)   
+        await asyncio.sleep(1)
         
-        await asyncio.sleep(0)
-        
-    async def show_measurement_screen(self): 
+    async def show_measurement_screen(self):
         # 
         # Measurement screen using a table
         #
@@ -512,22 +488,22 @@ class Display():
         mtable.set_cell_value(4,0, "RH")
         mtable.set_cell_value(5,0, "Noise")
         
-        mtable.set_cell_value(0,1, '{:.1f}'.format(spec_sensors.no2_ppb))
-        mtable.set_cell_value(1,1, '{:.1f}'.format(spec_sensors.ozone_ppb))
-        mtable.set_cell_value(2,1, '{:.1f}'.format(ps.pm25_reading))
-        mtable.set_cell_value(3,1, '{:.1f}'.format(temp_hum.temp_degc))
-        mtable.set_cell_value(4,1, '{:.1f}'.format(temp_hum.humid_rh))
-        mtable.set_cell_value(5,1, "N/A")
-        
         mtable.set_cell_value(0,2, "ppb")
         mtable.set_cell_value(1,2, "ppb")
         mtable.set_cell_value(2,2, "ug/m3")
         mtable.set_cell_value(3,2, "degC")
         mtable.set_cell_value(4,2, "%")
-        mtable.set_cell_value(5,2, "db")
-        
+        mtable.set_cell_value(5,2, "dB(A)")
+
         lv.scr_load(measurement_screen)
-        await asyncio.sleep(0)
+        self.backlight_ctrl.value(1)
+
+        mtable.set_cell_value(0,1, '{:.1f}'.format(spec_sensors.no2_ppb))
+        mtable.set_cell_value(1,1, '{:.1f}'.format(spec_sensors.ozone_ppb))
+        mtable.set_cell_value(2,1, '{:.1f}'.format(ps.pm25_reading))
+        mtable.set_cell_value(3,1, '{:.1f}'.format(temp_hum.temp_degc))
+        mtable.set_cell_value(4,1, '{:.1f}'.format(temp_hum.humid_rh))
+        mtable.set_cell_value(5,1, '{:.1f}'.format(mic.dba))
         
     async def show_voltage_monitor_screen(self): 
         # 
@@ -575,14 +551,18 @@ class Display():
         mtable.set_cell_value(0,0, "V_BAT")
         mtable.set_cell_value(1,0, "V_USB")
         
-        mtable.set_cell_value(0,1, '{:.2f}'.format(voltage_monitor.v_bat))
-        mtable.set_cell_value(1,1, '{:.2f}'.format(voltage_monitor.v_usb))
-        
         mtable.set_cell_value(0,2, "V")
         mtable.set_cell_value(1,2, "V")
         
         lv.scr_load(voltage_screen)
+        self.backlight_ctrl.value(1)
         
+        mtable.set_cell_value(0,1, '{:.2f}'.format(voltage_monitor.v_bat))
+        mtable.set_cell_value(1,1, '{:.2f}'.format(voltage_monitor.v_usb))
+
+    async def show_display_sleep_screen(self): 
+        self.backlight_ctrl.value(0)
+
     async def show_audio_screen(self):  
         '''
         self.tft.clearwin()
@@ -610,13 +590,12 @@ class SDCardLogger():
         pass
         
     async def run_logger(self):
-        print('SDCardLogger:  waiting for SD Card Init')
         print('SDCardLogger:  opening file')
         s = open('/sd/samples.csv', 'a+')
         await asyncio.sleep(0)
         # wait until data for all sensors is available
         # write sensor data to the SD Card in CSV format
-        numwrite = s.write('{}, {}, {}, {}, {}, {}, {:.1f}, {:.1f}\n'.format(
+        numwrite = s.write('{}, {}, {}, {}, {}, {}, {:.1f}, {:.1f}, {:.1f}\n'.format(
                                                     sample_timestamp, 
                                                     ps.pm25_reading,
                                                     spec_sensors.ozone_v_gas,
@@ -624,10 +603,11 @@ class SDCardLogger():
                                                     spec_sensors.no2_v_gas,
                                                     spec_sensors.no2_v_ref,
                                                     temp_hum.temp_degc,
-                                                    temp_hum.humid_rh))
-        print('wrote log')
+                                                    temp_hum.humid_rh,
+                                                    mic.dba))
+        print('SDCardLogger:  wrote log')
         await asyncio.sleep(0)
-        print('Logger:  s.close')
+        print('SDCardLogger:  s.close')
         s.close()
         await asyncio.sleep(0)
 
@@ -640,6 +620,9 @@ class MQTTPublish():
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
         self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'TdegC'), 'utf-8')
         self.feedname_humidity = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'humidity'), 'utf-8')
+        self.feedname_dba = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba'), 'utf-8')
+        self.feedname_vbat = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat'), 'utf-8')
+        
         self.wifi_status = 'unknown'
         
         self.client = MQTTClient(server='io.adafruit.com', 
@@ -667,6 +650,9 @@ class MQTTPublish():
             await self.client.publish(self.feedname_no2, '{}'.format(spec_sensors.no2_ppb), qos = 0)
             await self.client.publish(self.feedname_temp, '{:.2f}'.format(temp_hum.temp_degc), qos = 0)
             await self.client.publish(self.feedname_humidity, '{:.1f}'.format(temp_hum.humid_rh), qos = 0)
+            await self.client.publish(self.feedname_dba, '{:.1f}'.format(mic.dba), qos = 0)
+            await self.client.publish(self.feedname_vbat, '{:.2f}'.format(voltage_monitor.v_bat), qos = 0)
+            
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
             print('turn WiFi off')
@@ -676,6 +662,7 @@ class MQTTPublish():
             
 class Microphone():
     def __init__(self):
+        self.dba = 0
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_mic()) 
                 
@@ -699,6 +686,10 @@ class Microphone():
             dmacount=64,
             dmalen=256)
         timer_ms = ms_timer.MillisecTimer()
+        
+        noise = dba.DBA(samples=10000, resolution=dba.B16, 
+             coeffa=(1.0, -2.3604841 ,  0.83692802,  1.54849677, -0.96903429, -0.25092355,  0.1950274),
+             coeffb=(0.61367941, -1.22735882, -0.61367941,  2.45471764, -0.61367941, -1.22735882,  0.61367941))
                 
         print('Mic: opening WAV file')
         m=open('/sd/upy.wav','wb')
@@ -713,22 +704,18 @@ class Microphone():
         sdwrite_over_100ms = 0
         sdwrite_50_to_100ms = 0
         sdwrite_count = 0
-        dma_byte_capacity = 64 * 256 * NUM_BYTES_RX  # dmacount*dmalen*8
+        dma_capacity = 64 * 256 * NUM_BYTES_RX  # dmacount*dmalen*8
         samples = bytearray(NUM_BYTES_IN_SAMPLE_BLOCK)
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
         bytes_remaining_to_rx = NUM_SAMPLE_BYTES_TO_RX
-        print('Mic:  Start')
-        while bytes_remaining_to_rx > 0:
+        mic_file_open = True
+        print('Mic recording start')
+        while True:
             try:
                 start_ticks_us = utime.ticks_us()
 
                 # read samples from microphone
-                t0 = utime.ticks_us()
                 numread = audio.readinto(samples, timeout=0)
-                t1 = utime.ticks_us()
-                #print((t1-t0)/1000)
-
-                #print(bytes_remaining_to_rx)
                 bytes_remaining_to_rx -= numread
                 
                 if numread == 0:
@@ -739,41 +726,63 @@ class Microphone():
                 else:
                     bytes_in_dma_memory -= numread
                     
-                    # reduce sample resolution to 16 bits
-                    bitcrusher(samples, sd_sector)
+                    # copy sample from left channel and reduce sample resolution to 16 bits
+                    num_copied = i2stools.copy(bufin=samples, bufout=sd_sector, channel=i2stools.LEFT, format=i2stools.B16)
+                    
+                    # feed samples to dBA calculation
+                    res = noise.calc(sd_sector)
+                    if (res != None):
+                        # dba result ready
+                        self.dba = res
+                        #print("noise = {:.1f} dB(A)".format(self.dba))
                 
                     # write samples to SD Card
-                    start_sd_write = utime.ticks_us()
-                    numwrite = m.write(sd_sector)
-                    end_sd_write = utime.ticks_us()
-                    sdwrite_count += 1
+                    if bytes_remaining_to_rx > 0:
+                        start_sd_write = utime.ticks_us()
+                        numwrite = m.write(sd_sector)
+                        sd_write_time = utime.ticks_diff(utime.ticks_us(), start_sd_write)
+                        sdwrite_count += 1
+                        
+                        #print('sd_write_time = ', sd_write_time)
+                        if (sd_write_time) > 100*1000:  # 100ms
+                            sdwrite_over_100ms += 1
+                        elif (sd_write_time) > 50*1000:  # 50ms
+                            sdwrite_50_to_100ms += 1
+                            
+                            end_ticks_us = utime.ticks_us()  
+                            bytes_in_dma_memory += (utime.ticks_diff(end_ticks_us, start_ticks_us) * (SAMPLES_PER_SECOND * NUM_BYTES_RX)) // 1000000
+                            if bytes_in_dma_memory > dma_capacity:
+                                overrun_count += 1
+                                #print('Mic:  DMA overrun!, count= ', overrun_count)
+                    elif mic_file_open == True:
+                        m.close()
+                        print('================ Mic recording done ======================')
+                        print('Mic Stats:  overrun_count: {}, sdwrite_50_to_100ms: {}, sdwrite_over_100ms: {}, sdwrite_count:  {}'.format(overrun_count, sdwrite_50_to_100ms, sdwrite_over_100ms, sdwrite_count))
+                        #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
+                        mic_file_open = False
+                        
+                    # fft TODO  coming soon .... 
+                    '''
+                    num_samples = 256
+                    y = bytearray(num_samples * 4) # (sample / 2) freq bins, 2 floats per bin (real/imag)
+                    fft.fft(sd_sector, y)
                     
-                    sd_write_time = end_sd_write - start_sd_write
-                    if (sd_write_time) > 100*1000:  # 100ms
-                        sdwrite_over_100ms += 1
-                    elif (sd_write_time) > 50*1000:  # 50ms
-                        sdwrite_50_to_100ms += 1
-                    
-                    #print(sd_write_time/1000)
-                end_ticks_us = utime.ticks_us()
-                # TODO use ticks diff us routine
-                bytes_in_dma_memory += ((end_ticks_us - start_ticks_us) * (SAMPLES_PER_SECOND * NUM_BYTES_RX)) // 1000000
-                if bytes_in_dma_memory > dma_byte_capacity:
-                    overrun_count += 1
-                    #print('Mic:  DMA overrun!, count= ', overrun_count)
-                
+                    print('fft results')
+                    print(ustruct.unpack('>fffff', y)[0]) 
+                    print(ustruct.unpack('>fffff', y)[1]) 
+                    print(ustruct.unpack('>fffff', y)[2]) 
+                    print(ustruct.unpack('>fffff', y)[3]) 
+                    print(ustruct.unpack('>fffff', y)[4]) 
+                    '''
             except Exception as e:
-                print('unexpected exception {} {}'.format(type(e).__name__, e))
                 m.close()
                 audio.deinit()
-        m.close()
-        audio.deinit()
-        print('================ Mic:  Done ======================')
-        print('Mic Stats:  overrun_count: {}, sdwrite_50_to_100ms: {}, sdwrite_over_100ms: {}, sdwrite_count:  {}'.format(overrun_count, sdwrite_50_to_100ms, sdwrite_over_100ms, sdwrite_count))
-        #machine.reset()
-        #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
   
 class VoltageMonitor():
+    NUM_READINGS = 10
+    READING_PERIOD_MS = 100
+    V_BAT_CALIBRATION = 0.001757
+    V_USB_CALIBRATION = 0.001419    
     def __init__(self):
         self.v_bat = 0
         self.v_usb = 0
@@ -791,24 +800,18 @@ class VoltageMonitor():
         v_usb_sample_sum = 0
         
         while True:
-            # average 20 readings
-            for _ in range(20):
+            # take average of readings
+            for _ in range(VoltageMonitor.NUM_READINGS):
                 v_bat_sample_sum += self.vbat_pin.read()
                 v_usb_sample_sum += self.vusb_pin.read()
-                await asyncio.sleep_ms(50)
+                await asyncio.sleep_ms(VoltageMonitor.READING_PERIOD_MS)
                 
-            self.v_bat = v_bat_sample_sum * 0.001757 / 20 
-            self.v_usb = v_usb_sample_sum * 0.001419 / 20
+            self.v_bat = v_bat_sample_sum * VoltageMonitor.V_BAT_CALIBRATION / VoltageMonitor.NUM_READINGS 
+            self.v_usb = v_usb_sample_sum * VoltageMonitor.V_USB_CALIBRATION / VoltageMonitor.NUM_READINGS
             v_bat_sample_sum = 0
             v_usb_sample_sum = 0
-
-  
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
-#
-
-#
-#  TODO add stretch goal:  calculate noise db from audio samples
 #
 
 logging.basicConfig(level=logging.DEBUG)
@@ -820,8 +823,8 @@ temp_humid_sensor = si7021.Si7021(i2c)
 sample_timestamp = None  #  TODO implement without using a global
 esp.osdebug(esp.LOG_ERROR)
 pms5003.set_debug(False)
-asyncio.set_debug(0)
-asyncio.core.set_debug(0)
+asyncio.set_debug(False)
+asyncio.core.set_debug(False)
 
 # slot=2 configures SD Card to use the SPI3 controller (VSPI), DMA channel = 2
 # slot=3 configures SD Card to use the SPI2 controller (HSPI), DMA channel = 1
