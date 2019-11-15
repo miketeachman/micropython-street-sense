@@ -6,7 +6,6 @@
 # Street Sense Project:  Air and Noise pollution sensor unit
 # https://hackaday.io/project/162059-street-sense
 #
-
 import gc
 import sys
 import esp
@@ -37,6 +36,7 @@ import urtc
 import si7021
 import i2stools
 import dba
+import wavheader
 #import fft
 #import ustruct
 
@@ -126,30 +126,6 @@ NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYT
 NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
 PM25_POLLING_DELAY_MS = 500
-
-# TODO put this function into a file
-def gen_wav_header(
-    sampleRate,
-    bitsPerSample,
-    channels,
-    samples,
-    ):
-    datasize = samples * channels * bitsPerSample // 8
-    o = bytes('RIFF', 'ascii')  # (4byte) Marks file as RIFF
-    o += (datasize + 36).to_bytes(4, 'little')  # (4byte) File size in bytes excluding this and RIFF marker
-    o += bytes('WAVE', 'ascii')  # (4byte) File type
-    o += bytes('fmt ', 'ascii')  # (4byte) Format Chunk Marker
-    o += (16).to_bytes(4, 'little')  # (4byte) Length of above format data
-    o += (1).to_bytes(2, 'little')  # (2byte) Format type (1 - PCM)
-    o += channels.to_bytes(2, 'little')  # (2byte)
-    o += sampleRate.to_bytes(4, 'little')  # (4byte)
-    o += (sampleRate * channels * bitsPerSample // 8).to_bytes(4,
-            'little')  # (4byte)
-    o += (channels * bitsPerSample // 8).to_bytes(2, 'little')  # (2byte)
-    o += bitsPerSample.to_bytes(2, 'little')  # (2byte)
-    o += bytes('data', 'ascii')  # (4byte) Data Chunk Marker
-    o += datasize.to_bytes(4, 'little')  # (4byte) Data size in bytes
-    return o
 
 # TODO pass in ADC object
 class SpecSensors():
@@ -643,7 +619,6 @@ class SDCardLogger():
 class MQTTPublish():
     def __init__(self, event_mqtt_publish):    
         self.event_mqtt_publish = event_mqtt_publish    
-        MQTTClient.DEBUG = False
         self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'PM25'), 'utf-8')
         self.feedname_o3 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'o3'), 'utf-8')
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
@@ -722,7 +697,7 @@ class Microphone():
                 
         logmic.info('opening WAV file')
         m=open('/sd/upy.wav','wb')
-        wav_header = gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
+        wav_header = wavheader.gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
                             SAMPLES_PER_SECOND * RECORD_TIME_IN_SECONDS)
         logmic.debug('write WAV header')
         m.write(wav_header)
@@ -861,6 +836,7 @@ esp.osdebug(esp.LOG_ERROR)
 pms5003.set_debug(False)
 asyncio.set_debug(False)
 asyncio.core.set_debug(False)
+MQTTClient.DEBUG = False
 
 i2c = I2C(scl=Pin(26), sda=Pin(27))
 ds3231 = urtc.DS3231(i2c, address=0x68)
