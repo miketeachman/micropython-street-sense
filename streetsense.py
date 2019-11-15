@@ -111,12 +111,12 @@ import dba
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*15
+LOGGING_INTERVAL_IN_SECS = 60*2
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60*8
+RECORD_TIME_IN_SECONDS = 10
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -183,7 +183,7 @@ class SpecSensors():
             self.drdy_pin.irq(trigger=Pin.IRQ_FALLING, handler=self.callback)
         
     async def read(self, adc_channel):
-        print('adc_channel=', adc_channel)
+        log.info('read adc_channel= %d', adc_channel)
         self.sample_sum= 0 
         self.sample_count = 0     
         adc.set_channel(adc_channel)
@@ -194,21 +194,18 @@ class SpecSensors():
         adc.start_sync() # starts continuous sampling
         
         await asyncio.sleep(1)
-        print('start', utime.ticks_ms())
-
+        start_capture = utime.ticks_ms()
         self.drdy_pin.irq(trigger=Pin.IRQ_FALLING, handler=self.callback)
         
         while self.sample_count < self.SAMPLES_TO_CAPTURE:
-            #print(self.sample_count)
             await asyncio.sleep_ms(10)
 
-        self.drdy_pin.init()  # TBD - will this disable interrupt on pin ??
-        print('done', utime.ticks_ms())
-        
+        self.drdy_pin.init()  # TODO - will this disable interrupt on pin ??
+        log.debug('  done.  conversion time = %d', utime.ticks_diff(utime.ticks_ms(), start_capture))
         adc.set_conversion_mode(ADS1219.CM_SINGLE)
         
         avg_mv = self.sample_sum*2.048*1000/(2**23)/self.sample_count
-        print("avg_mv = ", avg_mv)
+        log.debug('  avg_mv = %d', avg_mv)
         
         return avg_mv
     
@@ -247,27 +244,26 @@ class ParticulateSensor():
         self.pm25_pwr_pin.value(0)
         
     async def read_pm25(self):
-        print('PM2.5:  power-up')
+        log.info('PM:  30s warm-up')
         self.pm25_pwr_pin.value(1)
-        print('PM2.5:  30s warm-up')
         await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
         self.uart = UART(1, tx=32, rx=33, baudrate=9600)
         self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
         await asyncio.sleep(1)
-        print('PM2.5:  set Passive mode')
+        log.debug('PM:  set Passive mode')
         await self.pm25.setPassiveMode()
-        print('PM2.5:  read sensor')
+        log.debug('PM:  trigger read sensor')
         await asyncio.sleep(1)
         await self.pm25.read()
-        print('PM2.5:  waiting for sensor event')
+        log.debug('PM:  waiting for event')
         await self.event_new_pm25_data
-        print('PM2.5:  got sensor event')
+        log.debug('PM:  got event')
         self.pm25_reading = await ps.get_value()
-        print('PM2.5:  value = {}'.format(self.pm25_reading))
+        log.info('PM:  PM2.5 = %d', self.pm25_reading)
         self.event_new_pm25_data.clear() 
         Pin(32, Pin.IN, Pin.PULL_DOWN)
         Pin(33, Pin.IN, Pin.PULL_DOWN)
-        print('PM2.5:  power-down')
+        log.info('PM:  power-down')
         self.pm25_pwr_pin.value(0)
         
     async def get_value(self):
@@ -296,9 +292,8 @@ class IntervalTimer():
             wake_time_list = list(wake_time_tuple)
             wake_time_list[3]=None  
             ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
-    
-            print('next sensor read at {}'.format(wake_time_list))
-            print('waiting for DS3231 alarm')
+            log.info('next sensor read at %s', wake_time_list)
+            log.info('waiting for DS3231 alarm')
             # loop until the DS3231 alarm is detected 
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
@@ -306,8 +301,7 @@ class IntervalTimer():
             sample_timestamp = urtc.tuple2seconds(ds3231.datetime())
             # clear alarm    
             ds3231.alarm(False, alarm=0)
-            
-            print('DS3231 alarm -> read all sensors')
+            log.info('DS3231 alarm -> read all sensors')
             # dispatch a whole pile of activity
             # following sequence is deliberately sequential so PM2.5 sensor is powered off when
             # the Spec Sensor devices are being read
@@ -625,7 +619,7 @@ class SDCardLogger():
         pass
         
     async def run_logger(self):
-        print('SDCardLogger:  opening file')
+        log.info('SDCardLogger:  opening file')
         s = open('/sd/samples.csv', 'a+')
         await asyncio.sleep(0)
         # wait until data for all sensors is available
@@ -640,9 +634,9 @@ class SDCardLogger():
                                                     temp_hum.temp_degc,
                                                     temp_hum.humid_rh,
                                                     mic.dba))
-        print('SDCardLogger:  wrote log')
+        log.info('SDCardLogger:  wrote log')
         await asyncio.sleep(0)
-        print('SDCardLogger:  s.close')
+        log.info('SDCardLogger:  s.close')
         s.close()
         await asyncio.sleep(0)
 
@@ -677,7 +671,7 @@ class MQTTPublish():
         self.client.pause()
         while True:
             await self.event_mqtt_publish
-            print('turn WiFi on')
+            log.info('turn WiFi on')
             self.wifi_status = 'on'
             self.client.resume()
             await self.client.publish(self.feedname_pm25, '{}'.format(ps.pm25_reading), qos = 0)
@@ -690,7 +684,7 @@ class MQTTPublish():
             
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
-            print('turn WiFi off')
+            log.info('turn WiFi off')
             self.wifi_status = 'off'
             self.client.pause()
             self.event_mqtt_publish.clear()
@@ -726,11 +720,11 @@ class Microphone():
              coeffa=(1.0, -2.3604841 ,  0.83692802,  1.54849677, -0.96903429, -0.25092355,  0.1950274),
              coeffb=(0.61367941, -1.22735882, -0.61367941,  2.45471764, -0.61367941, -1.22735882,  0.61367941))
                 
-        print('Mic: opening WAV file')
+        logmic.info('opening WAV file')
         m=open('/sd/upy.wav','wb')
         wav_header = gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
                             SAMPLES_PER_SECOND * RECORD_TIME_IN_SECONDS)
-        print('write WAV header')
+        logmic.debug('write WAV header')
         m.write(wav_header)
         numread = 0
         numwrite = 0
@@ -744,7 +738,7 @@ class Microphone():
         sd_sector = bytearray(NUM_BYTES_IN_SDCARD_SECTOR)
         bytes_remaining_to_rx = NUM_SAMPLE_BYTES_TO_RX
         mic_file_open = True
-        print('Mic recording start')
+        logmic.info('recording start')
         while True:
             try:
                 start_ticks_us = utime.ticks_us()
@@ -769,7 +763,7 @@ class Microphone():
                     if (res != None):
                         # dba result ready
                         self.dba = res
-                        #print("noise = {:.1f} dB(A)".format(self.dba))
+                        logmic.debug("noise = {:.1f} dB(A)".format(self.dba))
                 
                     # write samples to SD Card
                     if bytes_remaining_to_rx > 0:
@@ -778,7 +772,7 @@ class Microphone():
                         sd_write_time = utime.ticks_diff(utime.ticks_us(), start_sd_write)
                         sdwrite_count += 1
                         
-                        #print('sd_write_time = ', sd_write_time)
+                        logmic.debug('sd_write_time = %d', sd_write_time)
                         if (sd_write_time) > 100*1000:  # 100ms
                             sdwrite_over_100ms += 1
                         elif (sd_write_time) > 50*1000:  # 50ms
@@ -788,12 +782,17 @@ class Microphone():
                             bytes_in_dma_memory += (utime.ticks_diff(end_ticks_us, start_ticks_us) * (SAMPLES_PER_SECOND * NUM_BYTES_RX)) // 1000000
                             if bytes_in_dma_memory > dma_capacity:
                                 overrun_count += 1
-                                #print('Mic:  DMA overrun!, count= ', overrun_count)
+                                logmic.debug('Mic:  DMA overrun!, count= ', overrun_count)
                     elif mic_file_open == True:
                         m.close()
-                        print('================ Mic recording done ======================')
-                        print('Mic Stats:  overrun_count: {}, sdwrite_50_to_100ms: {}, sdwrite_over_100ms: {}, sdwrite_count:  {}'.format(overrun_count, sdwrite_50_to_100ms, sdwrite_over_100ms, sdwrite_count))
-                        #print('done mic. Percentage of zero I2S reads {:.1f}% '.format((1 - (count_sdwrite / count_i2sread)) * 100))
+                        logmic.info('recording done')
+                        logmic.info('Stats:\n  overrun_count: {}\n'
+                                    '  sdwrite_50_to_100ms: {}\n' 
+                                    '  sdwrite_over_100ms: {}\n' 
+                                    '  sdwrite_count:  {}\n'.format(overrun_count, 
+                                                                     sdwrite_50_to_100ms, 
+                                                                     sdwrite_over_100ms, 
+                                                                     sdwrite_count))
                         mic_file_open = False
                         
                     # fft TODO  coming soon .... 
@@ -849,17 +848,27 @@ class VoltageMonitor():
 #  TODO add User Interface, likely using setup screens driven by buttons
 #
 
-logging.basicConfig(level=logging.DEBUG)
+# streetsense debugging uses logging module in micropython-lib
+# levels:  debug, info, warning, error, critical
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('streetsense')  # general purpose debugging
+log.setLevel(logging.INFO)
+logmic = logging.getLogger('streetsense:mic') # microphone specific debug subsystem
+logmic.setLevel(logging.INFO)
+
+# debugging for other modules
+esp.osdebug(esp.LOG_ERROR)
+pms5003.set_debug(False)
+asyncio.set_debug(False)
+asyncio.core.set_debug(False)
+
 i2c = I2C(scl=Pin(26), sda=Pin(27))
 ds3231 = urtc.DS3231(i2c, address=0x68)
 adc = ADS1219(i2c, address=0x41)
 temp_humid_sensor = si7021.Si7021(i2c)
 
 sample_timestamp = None  #  TODO implement without using a global
-esp.osdebug(esp.LOG_ERROR)
-pms5003.set_debug(False)
-asyncio.set_debug(False)
-asyncio.core.set_debug(False)
+
 
 # slot=2 configures SD Card to use the SPI3 controller (VSPI), DMA channel = 2
 # slot=3 configures SD Card to use the SPI2 controller (HSPI), DMA channel = 1
