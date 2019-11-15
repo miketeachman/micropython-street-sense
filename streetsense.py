@@ -111,12 +111,12 @@ import dba
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*2
+LOGGING_INTERVAL_IN_SECS = 60*15
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 120
+RECORD_TIME_IN_SECONDS = 60*60*8
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -309,6 +309,8 @@ class IntervalTimer():
             
             print('DS3231 alarm -> read all sensors')
             # dispatch a whole pile of activity
+            # following sequence is deliberately sequential so PM2.5 sensor is powered off when
+            # the Spec Sensor devices are being read
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
@@ -317,7 +319,10 @@ class IntervalTimer():
 
 class Display():
     def __init__(self):
-        self.screens = [self.show_measurement_screen, self.show_voltage_monitor_screen, self.show_display_sleep_screen]
+        self.screens = [self.show_measurement_screen, 
+                        self.show_voltage_monitor_screen,
+                        self.show_decibel_screen, 
+                        self.show_display_sleep_screen]
         pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
         pb_screen = Pushbutton(pin_screen)
         pb_screen.press_func(self.next_screen)
@@ -335,7 +340,11 @@ class Display():
     async def run_display(self):
         # Initialize the ILI9341 driver
         # spihost:  1=HSPI 2=VSPI
-        disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, rst=15, backlight=2, mhz=20)
+        # Workaround note:  need to initialize the SPI bus before initializing LittlevGL
+        # SPI bus init was taken out of LittlevGL for streetsense design...should fix this.  TODO
+        # SPI bus initialization is done when the SD Card is initialized 
+        # (must be called before display initialization) 
+        disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, rst=15, backlight=2, mhz=25)
         disp.init()
         
         # Register display driver to LittlevGL
@@ -361,7 +370,7 @@ class Display():
             if (self.next_screen != self.active_screen):
                 self.active_screen = self.next_screen
             await self.screens[self.active_screen]()
-            await asyncio.sleep(2)  # TODO idea:  each screen might have a configurable update time                  
+            await asyncio.sleep(1)  # TODO idea:  each screen might have a configurable update time                  
         
     # following function is called when the screen advance button is pressed
     async def next_screen(self):
@@ -494,17 +503,17 @@ class Display():
         mtable.set_cell_value(3,2, "degC")
         mtable.set_cell_value(4,2, "%")
         mtable.set_cell_value(5,2, "dB(A)")
-
-        lv.scr_load(measurement_screen)
-        self.backlight_ctrl.value(1)
-
+        
         mtable.set_cell_value(0,1, '{:.1f}'.format(spec_sensors.no2_ppb))
         mtable.set_cell_value(1,1, '{:.1f}'.format(spec_sensors.ozone_ppb))
         mtable.set_cell_value(2,1, '{:.1f}'.format(ps.pm25_reading))
         mtable.set_cell_value(3,1, '{:.1f}'.format(temp_hum.temp_degc))
         mtable.set_cell_value(4,1, '{:.1f}'.format(temp_hum.humid_rh))
         mtable.set_cell_value(5,1, '{:.1f}'.format(mic.dba))
-        
+
+        lv.scr_load(measurement_screen)
+        self.backlight_ctrl.value(1)
+
     async def show_voltage_monitor_screen(self): 
         # 
         # Measurement screen using a table
@@ -554,24 +563,50 @@ class Display():
         mtable.set_cell_value(0,2, "V")
         mtable.set_cell_value(1,2, "V")
         
+        mtable.set_cell_value(0,1, '{:.2f}'.format(voltage_monitor.v_bat))
+        mtable.set_cell_value(1,1, '{:.2f}'.format(voltage_monitor.v_usb))
+        
         lv.scr_load(voltage_screen)
         self.backlight_ctrl.value(1)
         
-        mtable.set_cell_value(0,1, '{:.2f}'.format(voltage_monitor.v_bat))
-        mtable.set_cell_value(1,1, '{:.2f}'.format(voltage_monitor.v_usb))
-
     async def show_display_sleep_screen(self): 
         self.backlight_ctrl.value(0)
 
-    async def show_audio_screen(self):  
-        '''
-        self.tft.clearwin()
-        await asyncio.sleep(0)
-        self.tft.text(0, 0, "Audio Screen", color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 20, "... coming soon", color=self.tft.CYAN)
-        '''
-        pass
+    async def show_decibel_screen(self):  
+        # 
+        # Decibel screen
+        #
+        decibel_screen = lv.obj()
+        
+        # set background color, with no gradient
+        screenstyle = lv.style_t(lv.style_plain)
+        screenstyle.body.main_color = lv.color_hex(0xffffff)
+        # 0xFF, 0x00, 0x00  Red
+        # 0xC0, 0xC0, 0xC0  Silver
+        # 0xFF, 0xA5, 0x00  Orange
+        screenstyle.body.grad_color = lv.color_hex(0xffffff)
+        screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        screenstyle.body.border.width = 5
+        screenstyle.text.color = lv.color_hex(0xa028d4)
+        screenstyle.text.font = lv.font_roboto_120
+        decibel_screen.set_style(screenstyle)
+        
+        reading = lv.label(decibel_screen)
+        reading.set_x(40)
+        reading.set_y(70)
+        reading.set_text('{:.1f}'.format(mic.dba))
+        
+        unit = lv.label(decibel_screen)
+        unitstyle = lv.style_t(lv.style_plain)
+        unitstyle.text.color = lv.color_hex(0xa028d4)
+        unitstyle.text.font = lv.font_roboto_28
+        unit.set_style(lv.label.STYLE.MAIN, unitstyle)
+        unit.set_x(215)
+        unit.set_y(170)
+        unit.set_text("dBA")
+        
+        lv.scr_load(decibel_screen)        
+        self.backlight_ctrl.value(1)
         
     async def show_diag_screen(self):  
         '''
