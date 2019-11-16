@@ -37,6 +37,7 @@ import si7021
 import i2stools
 import dba
 import wavheader
+from collections import namedtuple
 #import fft
 #import ustruct
 
@@ -111,12 +112,12 @@ import wavheader
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*2
+LOGGING_INTERVAL_IN_SECS = 60*15
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 10
+RECORD_TIME_IN_SECONDS = 60*60*4
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -126,6 +127,45 @@ NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYT
 NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
 PM25_POLLING_DELAY_MS = 500
+
+#
+# measurement repo
+#
+# - stores measurements
+# - latest
+# - stats: min, max
+# - timestamps
+#
+class MeasurementRepo():
+    Measurement = namedtuple('Measurement', 'current min max')
+    
+    def __init__(self):
+        self.measurement_repo = {}
+
+    def add(self, measurement, value):
+        if not measurement in self.measurement_repo:
+            self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=None, min=None, max=None)
+    
+        min =  self.measurement_repo[measurement].min
+        if min is None or value < min:
+            min = value
+            
+        max =  self.measurement_repo[measurement].max  
+        if max is None or value > max:
+            max = value
+            
+        self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=value, min=min, max=max)
+            
+    def get(self, measurement):
+        if measurement in self.measurement_repo:
+            return  self.measurement_repo[measurement]
+        else:
+            return MeasurementRepo.Measurement(current=0, min=0, max=0)  
+        
+    def clear_stats(self, measurement):    
+        if measurement in self.measurement_repo:
+            value =  self.measurement_repo[measurement].current
+        self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=value, min=None, max=None)
 
 # TODO pass in ADC object
 class SpecSensors():
@@ -143,12 +183,6 @@ class SpecSensors():
         adc.set_data_rate(ADS1219.DR_20_SPS)
         adc.set_vref(ADS1219.VREF_INTERNAL)
         self.drdy_pin = Pin(34, mode=Pin.IN)        
-        self.ozone_v_gas = 0
-        self.ozone_v_ref = 0
-        self.ozone_ppb = 0
-        self.no2_v_gas = 0        
-        self.no2_v_ref = 0
-        self.no2_ppb = 0        
         
     def callback(self, arg):
         if self.sample_count < self.SAMPLES_TO_CAPTURE:
@@ -187,27 +221,29 @@ class SpecSensors():
     
     async def read_all(self):
         # read Ozone gas voltage
-        self.ozone_v_gas = await self.read(ADS1219.CHANNEL_AIN1)        
+        repo.add('o3_vgas', await self.read(ADS1219.CHANNEL_AIN1))        
         # read Ozone reference voltage
-        self.ozone_v_ref = await self.read(ADS1219.CHANNEL_AIN0)        
+        repo.add('o3_vref', await self.read(ADS1219.CHANNEL_AIN0))       
         # read NO2 gas voltage
-        self.no2_v_gas = await self.read(ADS1219.CHANNEL_AIN2)        
+        repo.add('no2_vgas', await self.read(ADS1219.CHANNEL_AIN2))        
         # read NO2 reference voltage
-        self.no2_v_ref = await self.read(ADS1219.CHANNEL_AIN3)        
+        repo.add('no2_vref', await self.read(ADS1219.CHANNEL_AIN3))      
         
         # calculate gas concentration in parts-per-billion (ppb)
         # TODO calibrate Spec Sensors, with offset
-        self.ozone_ppb = (self.ozone_v_gas - self.ozone_v_ref) / self.CALIBRATION_FACTOR_OZONE
-        self.no2_ppb = (self.no2_v_gas - self.no2_v_ref) / self.CALIBRATION_FACTOR_NO2
-        
+        ozone_ppb = (repo.get('o3_vgas').current - repo.get('o3_vref').current) / self.CALIBRATION_FACTOR_OZONE
+        repo.add('o3', ozone_ppb)
+        no2_ppb = (repo.get('no2_vgas').current - repo.get('no2_vref').current) / self.CALIBRATION_FACTOR_NO2
+        repo.add('no2', no2_ppb)
+
+# TODO does this class make sense anymore ?        
 class THSensor():
     def __init__(self):
-        self.temp_degc = 0
-        self.humid_rh = 0        
+        pass
         
     async def read(self):
-        self.temp_degc = temp_humid_sensor.temperature
-        self.humid_rh = temp_humid_sensor.relative_humidity
+        repo.add('tdegc', temp_humid_sensor.temperature)
+        repo.add('rh', temp_humid_sensor.relative_humidity)
 
 class ParticulateSensor():
     def __init__(self, 
@@ -215,7 +251,6 @@ class ParticulateSensor():
                  event_new_pm25_data):
         self.lock = lock
         self.event_new_pm25_data = event_new_pm25_data
-        self.pm25_reading = 0
         self.pm25_pwr_pin = Pin(25, Pin.OUT)
         self.pm25_pwr_pin.value(0)
         
@@ -234,14 +269,15 @@ class ParticulateSensor():
         log.debug('PM:  waiting for event')
         await self.event_new_pm25_data
         log.debug('PM:  got event')
-        self.pm25_reading = await ps.get_value()
-        log.info('PM:  PM2.5 = %d', self.pm25_reading)
+        repo.add('pm25', await ps.get_value())
+        log.info('PM:  PM2.5 = %d', repo.get('pm25').current)
         self.event_new_pm25_data.clear() 
         Pin(32, Pin.IN, Pin.PULL_DOWN)
         Pin(33, Pin.IN, Pin.PULL_DOWN)
         log.info('PM:  power-down')
         self.pm25_pwr_pin.value(0)
         
+    # TODO method needed anymore ?    
     async def get_value(self):
         return self.pm25.pm25_env
 
@@ -281,6 +317,7 @@ class IntervalTimer():
             # dispatch a whole pile of activity
             # following sequence is deliberately sequential so PM2.5 sensor is powered off when
             # the Spec Sensor devices are being read
+            # first clear all the measurement statistics
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
@@ -474,12 +511,12 @@ class Display():
         mtable.set_cell_value(4,2, "%")
         mtable.set_cell_value(5,2, "dB(A)")
         
-        mtable.set_cell_value(0,1, '{:.1f}'.format(spec_sensors.no2_ppb))
-        mtable.set_cell_value(1,1, '{:.1f}'.format(spec_sensors.ozone_ppb))
-        mtable.set_cell_value(2,1, '{:.1f}'.format(ps.pm25_reading))
-        mtable.set_cell_value(3,1, '{:.1f}'.format(temp_hum.temp_degc))
-        mtable.set_cell_value(4,1, '{:.1f}'.format(temp_hum.humid_rh))
-        mtable.set_cell_value(5,1, '{:.1f}'.format(mic.dba))
+        mtable.set_cell_value(0,1, '{:.1f}'.format(repo.get('no2').current))
+        mtable.set_cell_value(1,1, '{:.1f}'.format(repo.get('o3').current))
+        mtable.set_cell_value(2,1, '{:.1f}'.format(repo.get('pm25').current))
+        mtable.set_cell_value(3,1, '{:.1f}'.format(repo.get('tdegc').current))
+        mtable.set_cell_value(4,1, '{:.1f}'.format(repo.get('rh').current))
+        mtable.set_cell_value(5,1, '{:.1f}'.format(repo.get('dba').current))
 
         lv.scr_load(measurement_screen)
         self.backlight_ctrl.value(1)
@@ -533,8 +570,8 @@ class Display():
         mtable.set_cell_value(0,2, "V")
         mtable.set_cell_value(1,2, "V")
         
-        mtable.set_cell_value(0,1, '{:.2f}'.format(voltage_monitor.v_bat))
-        mtable.set_cell_value(1,1, '{:.2f}'.format(voltage_monitor.v_usb))
+        mtable.set_cell_value(0,1, '{:.2f}'.format(repo.get('vbat').current))
+        mtable.set_cell_value(1,1, '{:.2f}'.format(repo.get('vusb').current))
         
         lv.scr_load(voltage_screen)
         self.backlight_ctrl.value(1)
@@ -564,7 +601,7 @@ class Display():
         reading = lv.label(decibel_screen)
         reading.set_x(40)
         reading.set_y(70)
-        reading.set_text('{:.1f}'.format(mic.dba))
+        reading.set_text('{:.1f}'.format(repo.get('dba').current))
         
         unit = lv.label(decibel_screen)
         unitstyle = lv.style_t(lv.style_plain)
@@ -602,14 +639,14 @@ class SDCardLogger():
         # write sensor data to the SD Card in CSV format
         numwrite = s.write('{}, {}, {}, {}, {}, {}, {:.1f}, {:.1f}, {:.1f}\n'.format(
                                                     sample_timestamp, 
-                                                    ps.pm25_reading,
-                                                    spec_sensors.ozone_v_gas,
-                                                    spec_sensors.ozone_v_ref,
-                                                    spec_sensors.no2_v_gas,
-                                                    spec_sensors.no2_v_ref,
-                                                    temp_hum.temp_degc,
-                                                    temp_hum.humid_rh,
-                                                    mic.dba))
+                                                    repo.get('pm25').current,
+                                                    repo.get('o3_vgas').current,
+                                                    repo.get('o3_vref').current,
+                                                    repo.get('no2_vgas').current,
+                                                    repo.get('no2_vref').current,
+                                                    repo.get('tdegc').current,
+                                                    repo.get('rh').current,
+                                                    repo.get('dba').current))
         log.info('SDCardLogger:  wrote log')
         await asyncio.sleep(0)
         log.info('SDCardLogger:  s.close')
@@ -625,7 +662,9 @@ class MQTTPublish():
         self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'TdegC'), 'utf-8')
         self.feedname_humidity = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'humidity'), 'utf-8')
         self.feedname_dba = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba'), 'utf-8')
+        self.feedname_dba_max = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba_max'), 'utf-8')
         self.feedname_vbat = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat'), 'utf-8')
+        self.feedname_vbat_min = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat_min'), 'utf-8')
         
         self.wifi_status = 'unknown'
         
@@ -649,13 +688,15 @@ class MQTTPublish():
             log.info('turn WiFi on')
             self.wifi_status = 'on'
             self.client.resume()
-            await self.client.publish(self.feedname_pm25, '{}'.format(ps.pm25_reading), qos = 0)
-            await self.client.publish(self.feedname_o3, '{}'.format(spec_sensors.ozone_ppb), qos = 0)
-            await self.client.publish(self.feedname_no2, '{}'.format(spec_sensors.no2_ppb), qos = 0)
-            await self.client.publish(self.feedname_temp, '{:.2f}'.format(temp_hum.temp_degc), qos = 0)
-            await self.client.publish(self.feedname_humidity, '{:.1f}'.format(temp_hum.humid_rh), qos = 0)
-            await self.client.publish(self.feedname_dba, '{:.1f}'.format(mic.dba), qos = 0)
-            await self.client.publish(self.feedname_vbat, '{:.2f}'.format(voltage_monitor.v_bat), qos = 0)
+            await self.client.publish(self.feedname_pm25, '{}'.format(repo.get('pm25').current), qos = 0)
+            await self.client.publish(self.feedname_o3, '{}'.format(repo.get('o3').current), qos = 0)
+            await self.client.publish(self.feedname_no2, '{}'.format(repo.get('no2').current), qos = 0)
+            await self.client.publish(self.feedname_temp, '{:.2f}'.format(repo.get('tdegc').current), qos = 0)
+            await self.client.publish(self.feedname_humidity, '{:.1f}'.format(repo.get('rh').current), qos = 0)
+            await self.client.publish(self.feedname_dba, '{:.1f}'.format(repo.get('dba').current), qos = 0)
+            await self.client.publish(self.feedname_dba_max, '{:.1f}'.format(repo.get('dba').max), qos = 0)
+            await self.client.publish(self.feedname_vbat, '{:.2f}'.format(repo.get('vbat').current), qos = 0)
+            await self.client.publish(self.feedname_vbat_min, '{:.2f}'.format(repo.get('vbat').min), qos = 0)
             
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
@@ -664,9 +705,17 @@ class MQTTPublish():
             self.client.pause()
             self.event_mqtt_publish.clear()
             
+            # TODO need a better place to perform measurement stat clearing (another event sync object?)
+            repo.clear_stats('o3')
+            repo.clear_stats('no2')
+            repo.clear_stats('pm25')
+            repo.clear_stats('tdegc')
+            repo.clear_stats('rh')
+            repo.clear_stats('dba')
+            repo.clear_stats('vbat')
+            
 class Microphone():
     def __init__(self):
-        self.dba = 0
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_mic()) 
                 
@@ -737,8 +786,8 @@ class Microphone():
                     res = noise.calc(sd_sector)
                     if (res != None):
                         # dba result ready
-                        self.dba = res
-                        logmic.debug("noise = {:.1f} dB(A)".format(self.dba))
+                        repo.add('dba', res)
+                        logmic.debug("noise = {:.1f} dB(A)".format(repo.get('dba').current))
                 
                     # write samples to SD Card
                     if bytes_remaining_to_rx > 0:
@@ -793,8 +842,6 @@ class VoltageMonitor():
     V_BAT_CALIBRATION = 0.001757
     V_USB_CALIBRATION = 0.001419    
     def __init__(self):
-        self.v_bat = 0
-        self.v_usb = 0
         self.vbat_pin = ADC(Pin(35))
         self.vbat_pin.atten(ADC.ATTN_11DB)
         self.vbat_pin.width(ADC.WIDTH_12BIT)
@@ -815,8 +862,9 @@ class VoltageMonitor():
                 v_usb_sample_sum += self.vusb_pin.read()
                 await asyncio.sleep_ms(VoltageMonitor.READING_PERIOD_MS)
                 
-            self.v_bat = v_bat_sample_sum * VoltageMonitor.V_BAT_CALIBRATION / VoltageMonitor.NUM_READINGS 
-            self.v_usb = v_usb_sample_sum * VoltageMonitor.V_USB_CALIBRATION / VoltageMonitor.NUM_READINGS
+            repo.add('vbat', v_bat_sample_sum * VoltageMonitor.V_BAT_CALIBRATION / VoltageMonitor.NUM_READINGS)
+            repo.add('vusb', v_usb_sample_sum * VoltageMonitor.V_USB_CALIBRATION / VoltageMonitor.NUM_READINGS)
+            
             v_bat_sample_sum = 0
             v_usb_sample_sum = 0
 #
@@ -845,6 +893,9 @@ temp_humid_sensor = si7021.Si7021(i2c)
 
 sample_timestamp = None  #  TODO implement without using a global
 
+# all measurements are stored and retreived to/from 
+# a centralized repo
+repo = MeasurementRepo()
 
 # slot=2 configures SD Card to use the SPI3 controller (VSPI), DMA channel = 2
 # slot=3 configures SD Card to use the SPI2 controller (HSPI), DMA channel = 1
