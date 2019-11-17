@@ -17,6 +17,7 @@ from machine import Pin
 from machine import UART
 from machine import SDCard
 from machine import ADC
+from machine import Timer
 from array import array
 import uos
 import utime
@@ -299,9 +300,9 @@ class IntervalTimer():
         loop.create_task(self.run_timer()) 
     
     async def run_timer(self):
-        global unix_timestamp  # TODO fix this when interval timer becomes a class
+        global timestamp_unix  # TODO fix this when interval timer becomes a class
         ds3231.alarm(False, alarm=0)  # TODO fix this coupling
-        unix_timestamp = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
+        timestamp_unix = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
         while True:
             time_now = urtc.tuple2seconds(ds3231.datetime())
             
@@ -323,14 +324,13 @@ class IntervalTimer():
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
 
-            unix_timestamp = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
+            timestamp_unix = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
             # clear alarm    
             ds3231.alarm(False, alarm=0)
             log.info('DS3231 alarm -> read all sensors')
             # dispatch a whole pile of activity
             # following sequence is deliberately sequential so PM2.5 sensor is powered off when
             # the Spec Sensor devices are being read
-            # first clear all the measurement statistics
             await ps.read_pm25()
             await spec_sensors.read_all()
             await temp_hum.read()
@@ -338,6 +338,9 @@ class IntervalTimer():
             self.event_mqtt_publish.set()
 
 class Display():
+    SCREEN_TIMEOUT_IN_S = 60
+    SCREEN_REFRESH_IN_S = 1  # TODO idea:  each screen might have a configurable update time
+    
     def __init__(self):
         self.screens = [self.show_measurement_screen, 
                         self.show_voltage_monitor_screen,
@@ -349,6 +352,8 @@ class Display():
         self.active_screen = 1  # TODO make some sort of datastructure for screens + screen ids
         self.next_screen = 0 # show the measurement screen first TODO this is a clunky way to show this after measurement screen
         self.diag_count = 0
+        self.screen_timeout = False
+        self.timeout_timer = Timer(-1)
         self.backlight_ctrl = Pin(2, Pin.OUT)
         self.backlight_ctrl.value(1)
         loop = asyncio.get_event_loop()
@@ -386,15 +391,28 @@ class Display():
         
         # continually refresh the active screen
         # detect screen change coming from a button press
+        # detect screen timeout
         while True:
             if (self.next_screen != self.active_screen):
                 self.active_screen = self.next_screen
+                self.screen_timeout = False
+                self.timeout_timer.init(period=Display.SCREEN_TIMEOUT_IN_S * 1000, 
+                                        mode=Timer.ONE_SHOT, 
+                                        callback=self.screen_timeout_callback)
+                
+            elif (self.screen_timeout == True):
+                self.next_screen = 3  # TODO ugly. see above comment re:  datastructure for screens
+            
+            # display the active screen    
             await self.screens[self.active_screen]()
-            await asyncio.sleep(1)  # TODO idea:  each screen might have a configurable update time                  
+            await asyncio.sleep(Display.SCREEN_REFRESH_IN_S)                    
         
     # following function is called when the screen advance button is pressed
     async def next_screen(self):
         self.next_screen = (self.active_screen + 1) % len(self.screens)
+        
+    def screen_timeout_callback(self, t):
+        self.screen_timeout = True
         
     async def show_welcome_screens(self):
         #
@@ -628,34 +646,27 @@ class Display():
         lv.scr_load(decibel_screen)        
         self.backlight_ctrl.value(1)
         
-    async def show_diag_screen(self):  
-        '''
-        self.tft.clearwin()
-        await asyncio.sleep(0)
-        self.tft.text(0, 0, "Diag Screen ...", color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 20, "Count = {}".format(self.diag_count), color=self.tft.CYAN)
-        await asyncio.sleep(0)
-        self.tft.text(0, 40, "Wifi: {}".format(mqtt.wifi_status), color=self.tft.CYAN) 
-        '''
-        pass       
-        
 class SDCardLogger():
     def __init__(self):
         self.fn = None
         
     async def run_logger(self):
-        log.info('SDCardLogger:  opening file')
-        local_timestamp = gmt_to_pst(urtc.tuple2seconds(ds3231.datetime()))
-        ld = urtc.seconds2tuple(local_timestamp)
+        timestamp_local = gmt_to_pst(urtc.tuple2seconds(ds3231.datetime()))
+        ld = urtc.seconds2tuple(timestamp_local)
+        # does log file already exist?  Yes->open, append  No->create, write header
         if self.fn == None:
             self.fn = '/sd/meas-{}-{}-{}-{}-{}-{}.csv'.format(ld.year, ld.month, ld.day, ld.hour, ld.minute, ld.second)
-        s = open(self.fn, 'a+')
+            s = open(self.fn, 'w+')
+            numwrite = s.write('utc,pm25,o3,o3_vgas,o3_vref,no2,no2_vgas,no2_vref,tdegc,rh,dba\n')
+            log.info('SDCardLogger:  created new file')
+        else:
+            s = open(self.fn, 'a+')
+            log.info('SDCardLogger:  opened existing file')
+
         await asyncio.sleep(0)
-        # wait until data for all sensors is available
         # write sensor data to the SD Card in CSV format
-        numwrite = s.write('{}, {}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.1f}, {:.1f}\n'.format(
-                                                    unix_timestamp, 
+        numwrite = s.write('{}, {}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.1f},  {:.1f},  {:.1f}, {:.1f}\n'.format(
+                                                    timestamp_unix, 
                                                     repo.get('pm25').current,
                                                     repo.get('o3').current,
                                                     repo.get('o3_vgas').current,
@@ -666,9 +677,7 @@ class SDCardLogger():
                                                     repo.get('tdegc').current,
                                                     repo.get('rh').current,
                                                     repo.get('dba').current))
-        log.info('SDCardLogger:  wrote log')
-        await asyncio.sleep(0)
-        log.info('SDCardLogger:  s.close')
+        log.info('SDCardLogger:  wrote log and closed')
         s.close()
         await asyncio.sleep(0)
 
@@ -913,7 +922,7 @@ ds3231 = urtc.DS3231(i2c, address=0x68)
 adc = ADS1219(i2c, address=0x41)
 temp_humid_sensor = si7021.Si7021(i2c)
 
-unix_timestamp = None  #  TODO implement without using a global
+timestamp_unix = None  #  TODO implement without using a global
 
 # all measurements are stored and retreived to/from 
 # a centralized repo
