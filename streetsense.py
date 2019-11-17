@@ -117,7 +117,7 @@ LOGGING_INTERVAL_IN_SECS = 60*2
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*5
+RECORD_TIME_IN_SECONDS = 10
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -922,10 +922,16 @@ repo = MeasurementRepo()
 # slot=2 configures SD Card to use the SPI3 controller (VSPI), DMA channel = 2
 # slot=3 configures SD Card to use the SPI2 controller (HSPI), DMA channel = 1
 sd = SDCard(slot=3, sck=Pin(18), mosi=Pin(23), miso=Pin(19), cs=Pin(4))
-# TODO figure out the root cause of the intermittent problem 0x109 error that happens on mounting the SD Card
-utime.sleep(2) # workaround for 0x109 error (CRC error) that sometimes happens in the following mount call 
-uos.mount(sd, "/sd")
 
+# loop until mount() stops raising exception "OSError: 16"
+# which is related to this error "sdmmc_common: sdmmc_init_csd: send_csd returned 0x109"
+while True:
+    try:
+        uos.mount(sd, "/sd")
+        break
+    except:
+        utime.sleep_ms(100)
+        
 loop = asyncio.get_event_loop(ioq_len=2)
 lock = asyn.Lock()
 event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS)
