@@ -112,12 +112,12 @@ from collections import namedtuple
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*15
+LOGGING_INTERVAL_IN_SECS = 60*2
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60*4
+RECORD_TIME_IN_SECONDS = 60*5
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -127,6 +127,17 @@ NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYT
 NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
 PM25_POLLING_DELAY_MS = 500
+
+# convert a timestamp (in seconds) from MicroPython epoch to Unix epoch
+# from uPy docs:  "However, embedded ports use epoch of 2000-01-01 00:00:00 UTC"
+# Unix time epoch is 1970-01-01 00:00:00 UTC
+def epoch_time_upy_to_unix(upy_time):
+    return upy_time + 946684800
+
+# convert a timestamp (in seconds) from GMT to Pacific Standard Time (PST)
+# no support for DST
+def gmt_to_pst(gmt_time):
+    return gmt_time - (3600 * 8)
 
 #
 # measurement repo
@@ -288,10 +299,12 @@ class IntervalTimer():
         loop.create_task(self.run_timer()) 
     
     async def run_timer(self):
-        global sample_timestamp  # TODO fix this when interval timer becomes a class
+        global unix_timestamp  # TODO fix this when interval timer becomes a class
         ds3231.alarm(False, alarm=0)  # TODO fix this coupling
+        unix_timestamp = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
         while True:
             time_now = urtc.tuple2seconds(ds3231.datetime())
+            
             # calculate the next alarm time, aligned to the desired interval
             # e.g.  interval=15mins ==>  align to 00, 15, 30, 45 mins
             # TODO improve the first-time calc of wake_time ... missed starting about 10% of the time
@@ -310,7 +323,7 @@ class IntervalTimer():
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
 
-            sample_timestamp = urtc.tuple2seconds(ds3231.datetime())
+            unix_timestamp = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
             # clear alarm    
             ds3231.alarm(False, alarm=0)
             log.info('DS3231 alarm -> read all sensors')
@@ -629,19 +642,25 @@ class Display():
         
 class SDCardLogger():
     def __init__(self):
-        pass
+        self.fn = None
         
     async def run_logger(self):
         log.info('SDCardLogger:  opening file')
-        s = open('/sd/samples.csv', 'a+')
+        local_timestamp = gmt_to_pst(urtc.tuple2seconds(ds3231.datetime()))
+        ld = urtc.seconds2tuple(local_timestamp)
+        if self.fn == None:
+            self.fn = '/sd/meas-{}-{}-{}-{}-{}-{}.csv'.format(ld.year, ld.month, ld.day, ld.hour, ld.minute, ld.second)
+        s = open(self.fn, 'a+')
         await asyncio.sleep(0)
         # wait until data for all sensors is available
         # write sensor data to the SD Card in CSV format
-        numwrite = s.write('{}, {}, {}, {}, {}, {}, {:.1f}, {:.1f}, {:.1f}\n'.format(
-                                                    sample_timestamp, 
+        numwrite = s.write('{}, {}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.1f}, {:.1f}\n'.format(
+                                                    unix_timestamp, 
                                                     repo.get('pm25').current,
+                                                    repo.get('o3').current,
                                                     repo.get('o3_vgas').current,
                                                     repo.get('o3_vref').current,
+                                                    repo.get('no2').current,
                                                     repo.get('no2_vgas').current,
                                                     repo.get('no2_vref').current,
                                                     repo.get('tdegc').current,
@@ -656,15 +675,15 @@ class SDCardLogger():
 class MQTTPublish():
     def __init__(self, event_mqtt_publish):    
         self.event_mqtt_publish = event_mqtt_publish    
-        self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'PM25'), 'utf-8')
+        self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'pm25'), 'utf-8')
         self.feedname_o3 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'o3'), 'utf-8')
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
-        self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'TdegC'), 'utf-8')
+        self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'tdegc'), 'utf-8')
         self.feedname_humidity = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'humidity'), 'utf-8')
         self.feedname_dba = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba'), 'utf-8')
-        self.feedname_dba_max = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba_max'), 'utf-8')
+        self.feedname_dba_max = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dbamax'), 'utf-8')
         self.feedname_vbat = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat'), 'utf-8')
-        self.feedname_vbat_min = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat_min'), 'utf-8')
+        self.feedname_vbat_min = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbatmin'), 'utf-8')
         
         self.wifi_status = 'unknown'
         
@@ -745,7 +764,10 @@ class Microphone():
              coeffb=(0.61367941, -1.22735882, -0.61367941,  2.45471764, -0.61367941, -1.22735882,  0.61367941))
                 
         logmic.info('opening WAV file')
-        m=open('/sd/upy.wav','wb')
+        local_timestamp = gmt_to_pst(urtc.tuple2seconds(ds3231.datetime()))
+        ld = urtc.seconds2tuple(local_timestamp)
+        fn = '/sd/mic-{}-{}-{}-{}-{}-{}.wav'.format(ld.year, ld.month, ld.day, ld.hour, ld.minute, ld.second)
+        m=open(fn,'wb')
         wav_header = wavheader.gen_wav_header(SAMPLES_PER_SECOND, BITS_PER_SAMPLE, 1,
                             SAMPLES_PER_SECOND * RECORD_TIME_IN_SECONDS)
         logmic.debug('write WAV header')
@@ -891,7 +913,7 @@ ds3231 = urtc.DS3231(i2c, address=0x68)
 adc = ADS1219(i2c, address=0x41)
 temp_humid_sensor = si7021.Si7021(i2c)
 
-sample_timestamp = None  #  TODO implement without using a global
+unix_timestamp = None  #  TODO implement without using a global
 
 # all measurements are stored and retreived to/from 
 # a centralized repo
