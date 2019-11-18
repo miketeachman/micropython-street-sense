@@ -200,9 +200,6 @@ class SpecSensors():
         if self.sample_count < self.SAMPLES_TO_CAPTURE:
             self.sample_sum += adc.read_data_irq()
             self.sample_count += 1
-            # re-enable interrupt
-            #self.drdy_pin.init(trigger=Pin.IRQ_LOLEVEL)
-            self.drdy_pin.irq(trigger=Pin.IRQ_FALLING, handler=self.callback)
         
     async def read(self, adc_channel):
         log.info('read adc_channel= %d', adc_channel)
@@ -214,19 +211,19 @@ class SpecSensors():
         adc.set_data_rate(ADS1219.DR_20_SPS)
         adc.set_vref(ADS1219.VREF_INTERNAL)
         adc.start_sync() # starts continuous sampling
-        
-        await asyncio.sleep(1)
         start_capture = utime.ticks_ms()
+        # enable interrupts
         self.drdy_pin.irq(trigger=Pin.IRQ_FALLING, handler=self.callback)
         
         while self.sample_count < self.SAMPLES_TO_CAPTURE:
             await asyncio.sleep_ms(10)
 
-        self.drdy_pin.init()  # TODO - will this disable interrupt on pin ??
+        # disable the interrupt by setting handler = None
+        self.drdy_pin.irq(handler = None)
         log.debug('  done.  conversion time = %d', utime.ticks_diff(utime.ticks_ms(), start_capture))
         adc.set_conversion_mode(ADS1219.CM_SINGLE)
         
-        avg_mv = self.sample_sum*2.048*1000/(2**23)/self.sample_count
+        avg_mv = self.sample_sum * ADS1219.VREF_INTERNAL_MV / ADS1219.POSITIVE_CODE_RANGE / self.sample_count
         log.debug('  avg_mv = %d', avg_mv)
         
         return avg_mv
