@@ -22,10 +22,10 @@ Lolin D32 Pro
 fork of micropython
 https://github.com/miketeachman/micropython/tree/esp32-i2s-streetsense-littlevgl
 which includes these customizations:
-- I2S module to read audio samples from an I2S microphone
-- dba module for calculating dB(A) from a stream of audio samples  
-- i2stools module for efficient copy/pruning of audio samples
-- integration of littlevGL graphics library
+- I2S module to read audio samples from an I2S microphone. [link](https://github.com/miketeachman/micropython/blob/esp32-i2s-streetsense-littlevgl/ports/esp32/machine_i2s.c)
+- dba module for calculating dB(A) from a stream of audio samples. [link](https://github.com/miketeachman/micropython/blob/esp32-i2s-streetsense-littlevgl/ports/esp32/moddba.c)  
+- i2stools module for efficient copy/pruning of audio samples. [link](https://github.com/miketeachman/micropython/blob/esp32-i2s-streetsense-littlevgl/ports/esp32/modi2stools.c)
+- integration of littlevGL graphics library. [link](https://github.com/miketeachman/lv_binding_micropython/tree/lvgl-streetsense)
 
 ### MicroPython Modules
 
