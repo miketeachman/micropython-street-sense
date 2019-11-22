@@ -331,6 +331,10 @@ class IntervalTimer():
             await temp_hum.read()
             await sdcard_logger.run_logger()
             self.event_mqtt_publish.set()
+            mem_free_before_gc = gc.mem_free()
+            log.debug('gc mem_free = %d bytes', mem_free_before_gc)
+            gc.collect()
+            log.debug('gc freed %d bytes', gc.mem_free() - mem_free_before_gc)
 
 class Display():
     SCREEN_TIMEOUT_IN_S = 60
