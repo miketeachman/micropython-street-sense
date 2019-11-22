@@ -118,7 +118,7 @@ LOGGING_INTERVAL_IN_SECS = 60*2
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 10
+RECORD_TIME_IN_SECONDS = 60*60*8
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -299,15 +299,13 @@ class IntervalTimer():
     async def run_timer(self):
         global timestamp_unix  # TODO fix this when interval timer becomes a class
         ds3231.alarm(False, alarm=0)  # TODO fix this coupling
-        timestamp_unix = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
         while True:
             time_now = urtc.tuple2seconds(ds3231.datetime())
             
             # calculate the next alarm time, aligned to the desired interval
             # e.g.  interval=15mins ==>  align to 00, 15, 30, 45 mins
-            # TODO improve the first-time calc of wake_time ... missed starting about 10% of the time
-            time_now += 10  # to eliminate risk of timing hazard close to interval boundary
-            wake_time = int(math.ceil(time_now / LOGGING_INTERVAL_IN_SECS) * LOGGING_INTERVAL_IN_SECS)
+            time_now += 5  # eliminate risk of timing hazard close to interval boundary
+            wake_time = ((time_now // LOGGING_INTERVAL_IN_SECS) + 1 ) * LOGGING_INTERVAL_IN_SECS
             
             # set day-of-week (4th element) to None so alarm uses day-of-month (urtc module API requirement)
             # some gymnastics needed ...
