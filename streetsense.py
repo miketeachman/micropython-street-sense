@@ -113,7 +113,7 @@ from collections import namedtuple
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*2
+LOGGING_INTERVAL_IN_SECS = 60*15
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
@@ -141,22 +141,21 @@ def gmt_to_pst(gmt_time):
     return gmt_time - (3600 * 8)
 
 #
-# measurement repo
-#
-# - stores measurements
-# - latest
-# - stats: min, max
-# - timestamps
+# Measurement Repository
+# - stores current value of measurements
+# - calculates stats: min, max, sum, avg, count
 #
 class MeasurementRepo():
-    Measurement = namedtuple('Measurement', 'current min max')
+    Measurement = namedtuple('Measurement', 'current min max sum avg count')
     
     def __init__(self):
+        log.info('REPO:init')
         self.measurement_repo = {}
 
     def add(self, measurement, value):
+        log.debug('REPO:add')
         if not measurement in self.measurement_repo:
-            self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=None, min=None, max=None)
+            self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=None, min=None, max=None, sum=0, avg=0, count=0)
     
         min =  self.measurement_repo[measurement].min
         if min is None or value < min:
@@ -166,18 +165,24 @@ class MeasurementRepo():
         if max is None or value > max:
             max = value
             
-        self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=value, min=min, max=max)
+        sum = self.measurement_repo[measurement].sum + value
+        count = self.measurement_repo[measurement].count + 1
+        avg = sum / count
+            
+        self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=value, min=min, max=max, sum=sum, avg=avg, count=count)
             
     def get(self, measurement):
+        log.debug('REPO:get')
         if measurement in self.measurement_repo:
-            return  self.measurement_repo[measurement]
+            return self.measurement_repo[measurement]
         else:
-            return MeasurementRepo.Measurement(current=0, min=0, max=0)  
+            return MeasurementRepo.Measurement(current=0, min=0, max=0, sum=0, avg=0, count=0)  
         
     def clear_stats(self, measurement):    
+        log.debug('REPO:clear')
         if measurement in self.measurement_repo:
             value =  self.measurement_repo[measurement].current
-        self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=value, min=None, max=None)
+        self.measurement_repo[measurement] = MeasurementRepo.Measurement(current=value, min=None, max=None, sum=0, avg=0, count=0)
 
 # TODO pass in ADC object
 class SpecSensors():
@@ -186,6 +191,7 @@ class SpecSensors():
     CALIBRATION_FACTOR_NO2 = (-11.13768*(10**-3))   # mV/ppb
                           
     def __init__(self):
+        log.info('SPEC:init')
         self.sample_count = 0
         self.sample_sum = 2**32-1   # allocate 4 byte sample to be used in ISR  TODO needed?
 
@@ -202,7 +208,7 @@ class SpecSensors():
             self.sample_count += 1
         
     async def read(self, adc_channel):
-        log.info('read adc_channel= %d', adc_channel)
+        log.info('SPEC:read adc_channel= %d', adc_channel)
         self.sample_sum= 0 
         self.sample_count = 0     
         adc.set_channel(adc_channel)
@@ -220,11 +226,11 @@ class SpecSensors():
 
         # disable the interrupt by setting handler = None
         self.drdy_pin.irq(handler = None)
-        log.debug('  done.  conversion time = %d', utime.ticks_diff(utime.ticks_ms(), start_capture))
+        log.debug('SPEC:done.  conversion time = %d', utime.ticks_diff(utime.ticks_ms(), start_capture))
         adc.set_conversion_mode(ADS1219.CM_SINGLE)
         
         avg_mv = self.sample_sum * ADS1219.VREF_INTERNAL_MV / ADS1219.POSITIVE_CODE_RANGE / self.sample_count
-        log.debug('  avg_mv = %d', avg_mv)
+        log.debug('SPEC:avg_mv = %d', avg_mv)
         
         return avg_mv
     
@@ -248,8 +254,8 @@ class SpecSensors():
 # TODO does this class make sense anymore ?        
 class THSensor():
     def __init__(self):
-        pass
-        
+        log.info('TH:init')
+
     async def read(self):
         repo.add('tdegc', temp_humid_sensor.temperature)
         repo.add('rh', temp_humid_sensor.relative_humidity)
@@ -258,32 +264,33 @@ class ParticulateSensor():
     def __init__(self, 
                  lock, 
                  event_new_pm25_data):
+        log.info('PM:init')
         self.lock = lock
         self.event_new_pm25_data = event_new_pm25_data
         self.pm25_pwr_pin = Pin(25, Pin.OUT)
         self.pm25_pwr_pin.value(0)
         
     async def read_pm25(self):
-        log.info('PM:  30s warm-up')
+        log.info('PM:30s warm-up')
         self.pm25_pwr_pin.value(1)
         await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
         self.uart = UART(1, tx=32, rx=33, baudrate=9600)
         self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
         await asyncio.sleep(1)
-        log.debug('PM:  set Passive mode')
+        log.debug('PM:set Passive mode')
         await self.pm25.setPassiveMode()
-        log.debug('PM:  trigger read sensor')
+        log.debug('PM:trigger read sensor')
         await asyncio.sleep(1)
         await self.pm25.read()
-        log.debug('PM:  waiting for event')
+        log.debug('PM:waiting for event')
         await self.event_new_pm25_data
-        log.debug('PM:  got event')
+        log.debug('PM:got event')
         repo.add('pm25', await ps.get_value())
-        log.info('PM:  PM2.5 = %d', repo.get('pm25').current)
+        log.info('PM:PM2.5 = %d', repo.get('pm25').current)
         self.event_new_pm25_data.clear() 
         Pin(32, Pin.IN, Pin.PULL_DOWN)
         Pin(33, Pin.IN, Pin.PULL_DOWN)
-        log.info('PM:  power-down')
+        log.info('PM:power-down')
         self.pm25_pwr_pin.value(0)
         
     # TODO method needed anymore ?    
@@ -291,7 +298,8 @@ class ParticulateSensor():
         return self.pm25.pm25_env
 
 class IntervalTimer():
-    def __init__(self, event_mqtt_publish):    
+    def __init__(self, event_mqtt_publish):  
+        log.info('TMR:init')
         self.event_mqtt_publish = event_mqtt_publish
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_timer()) 
@@ -313,8 +321,8 @@ class IntervalTimer():
             wake_time_list = list(wake_time_tuple)
             wake_time_list[3]=None  
             ds3231.alarm_time(wake_time_list, alarm=0)  # TODO fix coupling   
-            log.info('next sensor read at %s', wake_time_list)
-            log.info('waiting for DS3231 alarm')
+            log.info('TMR:next sensor read at %s', wake_time_list)
+            log.info('TMR:waiting for DS3231 alarm')
             # loop until the DS3231 alarm is detected 
             while ds3231.alarm(alarm=0) == False:
                 await asyncio.sleep_ms(250)
@@ -322,7 +330,7 @@ class IntervalTimer():
             timestamp_unix = epoch_time_upy_to_unix(urtc.tuple2seconds(ds3231.datetime()))
             # clear alarm    
             ds3231.alarm(False, alarm=0)
-            log.info('DS3231 alarm -> read all sensors')
+            log.info('TMR:DS3231 alarm -> read all sensors')
             # dispatch a whole pile of activity
             # following sequence is deliberately sequential so PM2.5 sensor is powered off when
             # the Spec Sensor devices are being read
@@ -332,15 +340,16 @@ class IntervalTimer():
             await sdcard_logger.run_logger()
             self.event_mqtt_publish.set()
             mem_free_before_gc = gc.mem_free()
-            log.debug('gc mem_free = %d bytes', mem_free_before_gc)
+            log.debug('TMR:gc mem_free = %d bytes', mem_free_before_gc)
             gc.collect()
-            log.debug('gc freed %d bytes', gc.mem_free() - mem_free_before_gc)
+            log.debug('TMR:gc freed %d bytes', gc.mem_free() - mem_free_before_gc)
 
 class Display():
     SCREEN_TIMEOUT_IN_S = 60
     SCREEN_REFRESH_IN_S = 1  # TODO idea:  each screen might have a configurable update time
     
     def __init__(self):
+        log.info('DISP:init')
         self.screens = [self.show_measurement_screen, 
                         self.show_voltage_monitor_screen,
                         self.show_decibel_screen, 
@@ -647,6 +656,7 @@ class Display():
         
 class SDCardLogger():
     def __init__(self):
+        log.info('SD:init')
         self.fn = None
         
     async def run_logger(self):
@@ -656,42 +666,54 @@ class SDCardLogger():
         if self.fn == None:
             self.fn = '/sd/meas-{}-{}-{}-{}-{}-{}.csv'.format(ld.year, ld.month, ld.day, ld.hour, ld.minute, ld.second)
             s = open(self.fn, 'w+')
-            numwrite = s.write('utc,pm25,o3,o3_vgas,o3_vref,no2,no2_vgas,no2_vref,tdegc,rh,dba\n')
-            log.info('SDCardLogger:  created new file')
+            numwrite = s.write('utc,pm25,o3,o3_vgas,o3_vref,no2,no2_vgas,no2_vref,tdegc,rh,dba_avg,dba_min,'
+                               'vusb_avg,vusb_min,vbat_avg,vbat_min\n')
+            log.info('SD:created new file')
         else:
             s = open(self.fn, 'a+')
-            log.info('SDCardLogger:  opened existing file')
+            log.info('SD:opened existing file')
 
         await asyncio.sleep(0)
         # write sensor data to the SD Card in CSV format
-        numwrite = s.write('{}, {}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.2f}, {:.1f},  {:.1f},  {:.1f}, {:.1f}\n'.format(
-                                                    timestamp_unix, 
-                                                    repo.get('pm25').current,
-                                                    repo.get('o3').current,
-                                                    repo.get('o3_vgas').current,
-                                                    repo.get('o3_vref').current,
-                                                    repo.get('no2').current,
-                                                    repo.get('no2_vgas').current,
-                                                    repo.get('no2_vref').current,
-                                                    repo.get('tdegc').current,
-                                                    repo.get('rh').current,
-                                                    repo.get('dba').current))
-        log.info('SDCardLogger:  wrote log and closed')
+        numwrite = s.write('{}, {},' 
+                           '{:.2f},{:.2f},{:.2f},' 
+                           '{:.2f},{:.2f},{:.2f},'
+                           '{:.1f},{:.1f},'
+                           '{:.1f},{:.1f},'
+                           '{:.2f},{:.2f},{:.2f},{:.2f}\n'.format(
+                            timestamp_unix, 
+                            repo.get('pm25').current,
+                            repo.get('o3').current,
+                            repo.get('o3_vgas').current,
+                            repo.get('o3_vref').current,
+                            repo.get('no2').current,
+                            repo.get('no2_vgas').current,
+                            repo.get('no2_vref').current,
+                            repo.get('tdegc').current,
+                            repo.get('rh').current,
+                            repo.get('dba').avg,
+                            repo.get('dba').min,
+                            repo.get('vusb').avg,
+                            repo.get('vusb').min,
+                            repo.get('vbat').avg,
+                            repo.get('vbat').min))
+        log.info('SD:wrote log and closed')
         s.close()
         await asyncio.sleep(0)
 
 class MQTTPublish():
-    def __init__(self, event_mqtt_publish):    
+    def __init__(self, event_mqtt_publish):
+        log.info('MQTT:init')
         self.event_mqtt_publish = event_mqtt_publish    
         self.feedname_pm25 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'pm25'), 'utf-8')
         self.feedname_o3 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'o3'), 'utf-8')
         self.feedname_no2 = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'no2'), 'utf-8')
         self.feedname_temp = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'tdegc'), 'utf-8')
         self.feedname_humidity = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'humidity'), 'utf-8')
-        self.feedname_dba = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba'), 'utf-8')
-        self.feedname_dba_max = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dbamax'), 'utf-8')
-        self.feedname_vbat = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat'), 'utf-8')
-        self.feedname_vbat_min = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbatmin'), 'utf-8')
+        self.feedname_dba_avg = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba_avg'), 'utf-8')
+        self.feedname_dba_max = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'dba_max'), 'utf-8')
+        self.feedname_vbat_avg = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat_avg'), 'utf-8')
+        self.feedname_vbat_min = bytes('{:s}/feeds/{:s}'.format(b'MikeTeachman', b'vbat_min'), 'utf-8')
         
         self.wifi_status = 'unknown'
         
@@ -712,7 +734,7 @@ class MQTTPublish():
         self.client.pause()
         while True:
             await self.event_mqtt_publish
-            log.info('turn WiFi on')
+            log.info('MQTT:turn WiFi on')
             self.wifi_status = 'on'
             self.client.resume()
             await self.client.publish(self.feedname_pm25, '{}'.format(repo.get('pm25').current), qos = 0)
@@ -720,22 +742,26 @@ class MQTTPublish():
             await self.client.publish(self.feedname_no2, '{}'.format(repo.get('no2').current), qos = 0)
             await self.client.publish(self.feedname_temp, '{:.2f}'.format(repo.get('tdegc').current), qos = 0)
             await self.client.publish(self.feedname_humidity, '{:.1f}'.format(repo.get('rh').current), qos = 0)
-            await self.client.publish(self.feedname_dba, '{:.1f}'.format(repo.get('dba').current), qos = 0)
+            await self.client.publish(self.feedname_dba_avg, '{:.1f}'.format(repo.get('dba').avg), qos = 0)
             await self.client.publish(self.feedname_dba_max, '{:.1f}'.format(repo.get('dba').max), qos = 0)
-            await self.client.publish(self.feedname_vbat, '{:.2f}'.format(repo.get('vbat').current), qos = 0)
+            await self.client.publish(self.feedname_vbat_avg, '{:.2f}'.format(repo.get('vbat').avg), qos = 0)
             await self.client.publish(self.feedname_vbat_min, '{:.2f}'.format(repo.get('vbat').min), qos = 0)
             
             # pausing the MQTT client will turn off the WiFi radio
             # which reduces the processor power usage
-            log.info('turn WiFi off')
+            log.info('MQTT:turn WiFi off')
             self.wifi_status = 'off'
             self.client.pause()
             self.event_mqtt_publish.clear()
             
             # TODO need a better place to perform measurement stat clearing (another event sync object?)
-            repo.clear_stats('o3')
-            repo.clear_stats('no2')
             repo.clear_stats('pm25')
+            repo.clear_stats('o3')
+            repo.clear_stats('o3_vgas')
+            repo.clear_stats('o3_vref')
+            repo.clear_stats('no2')
+            repo.clear_stats('no2_vgas')
+            repo.clear_stats('no2_vref')
             repo.clear_stats('tdegc')
             repo.clear_stats('rh')
             repo.clear_stats('dba')
@@ -743,6 +769,7 @@ class MQTTPublish():
             
 class Microphone():
     def __init__(self):
+        logmic.info('init')
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_mic()) 
                 
@@ -872,6 +899,7 @@ class VoltageMonitor():
     V_BAT_CALIBRATION = 0.001757
     V_USB_CALIBRATION = 0.001419    
     def __init__(self):
+        log.info('VMON:init')
         self.vbat_pin = ADC(Pin(35))
         self.vbat_pin.atten(ADC.ATTN_11DB)
         self.vbat_pin.width(ADC.WIDTH_12BIT)
@@ -902,11 +930,11 @@ class VoltageMonitor():
 #
 
 # streetsense debugging uses logging module in micropython-lib
-# levels:  debug, info, warning, error, critical
+# levels:  DEBUG, INFO, WARNING, ERROR, CRITICAL
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('streetsense')  # general purpose debugging
 log.setLevel(logging.INFO)
-logmic = logging.getLogger('streetsense:mic') # microphone specific debug subsystem
+logmic = logging.getLogger('streetsense:MIC') # microphone specific debug subsystem
 logmic.setLevel(logging.INFO)
 
 # debugging for other modules
