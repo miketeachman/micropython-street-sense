@@ -666,7 +666,7 @@ class SDCardLogger():
         if self.fn == None:
             self.fn = '/sd/meas-{}-{}-{}-{}-{}-{}.csv'.format(ld.year, ld.month, ld.day, ld.hour, ld.minute, ld.second)
             s = open(self.fn, 'w+')
-            numwrite = s.write('utc,pm25,o3,o3_vgas,o3_vref,no2,no2_vgas,no2_vref,tdegc,rh,dba_avg,dba_min,'
+            numwrite = s.write('utc,pm25,o3,o3_vgas,o3_vref,no2,no2_vgas,no2_vref,tdegc,rh,dba_avg,dba_max,'
                                'vusb_avg,vusb_min,vbat_avg,vbat_min\n')
             log.info('SD:created new file')
         else:
@@ -692,7 +692,7 @@ class SDCardLogger():
                             repo.get('tdegc').current,
                             repo.get('rh').current,
                             repo.get('dba').avg,
-                            repo.get('dba').min,
+                            repo.get('dba').max,
                             repo.get('vusb').avg,
                             repo.get('vusb').min,
                             repo.get('vbat').avg,
@@ -765,6 +765,7 @@ class MQTTPublish():
             repo.clear_stats('tdegc')
             repo.clear_stats('rh')
             repo.clear_stats('dba')
+            repo.clear_stats('vusb')
             repo.clear_stats('vbat')
             
 class Microphone():
