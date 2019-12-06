@@ -113,12 +113,12 @@ from collections import namedtuple
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*15
+LOGGING_INTERVAL_IN_SECS = 60*2
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60*8
+RECORD_TIME_IN_SECONDS = 30
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -345,14 +345,14 @@ class IntervalTimer():
             log.debug('TMR:gc freed %d bytes', gc.mem_free() - mem_free_before_gc)
 
 class Display():
-    SCREEN_TIMEOUT_IN_S = 60
+    SCREEN_TIMEOUT_IN_S = 60*5
     SCREEN_REFRESH_IN_S = 1  # TODO idea:  each screen might have a configurable update time
     
     def __init__(self):
         log.info('DISP:init')
         self.screens = [self.show_measurement_screen, 
-                        self.show_voltage_monitor_screen,
                         self.show_decibel_screen, 
+                        self.show_voltage_monitor_screen,
                         self.show_display_sleep_screen]
         pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
         pb_screen = Pushbutton(pin_screen)
@@ -445,7 +445,7 @@ class Display():
         img.set_src(img_dsc)
         
         lv.scr_load(welcome_screen1)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
         #
         # show GVCC image 
         #
@@ -469,7 +469,7 @@ class Display():
         img.set_src(img_dsc)
         lv.scr_load(welcome_screen2)
         
-        await asyncio.sleep(1)
+        await asyncio.sleep(3)
         #
         # show GV Placemaking image 
         #
@@ -491,7 +491,7 @@ class Display():
         
         img.set_src(img_dsc)
         lv.scr_load(welcome_screen3)   
-        await asyncio.sleep(1)
+        await asyncio.sleep(3)
         
     async def show_measurement_screen(self):
         # 
@@ -511,8 +511,8 @@ class Display():
         # 0xC0, 0xC0, 0xC0  Silver
         # 0xFF, 0xA5, 0x00  Orange
         #screenstyle.body.grad_color = lv.color_make(0xFF, 0xA5, 0x00)
-        screenstyle.body.border.color = lv.color_hex(0xe32a19)
-        screenstyle.body.border.width = 5
+        #screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        #screenstyle.body.border.width = 5
         measurement_screen.set_style(screenstyle)
         
         tablestyle = lv.style_t(lv.style_plain)
@@ -578,8 +578,8 @@ class Display():
         # 0xC0, 0xC0, 0xC0  Silver
         # 0xFF, 0xA5, 0x00  Orange
         #screenstyle.body.grad_color = lv.color_make(0xFF, 0xA5, 0x00)
-        screenstyle.body.border.color = lv.color_hex(0xe32a19)
-        screenstyle.body.border.width = 5
+        #screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        #screenstyle.body.border.width = 5
         voltage_screen.set_style(screenstyle)
         
         tablestyle = lv.style_t(lv.style_plain)
@@ -623,28 +623,41 @@ class Display():
         # Decibel screen
         #
         decibel_screen = lv.obj()
+        dba = repo.get('dba').current
         
-        # set background color, with no gradient
         screenstyle = lv.style_t(lv.style_plain)
-        screenstyle.body.main_color = lv.color_hex(0xffffff)
         # 0xFF, 0x00, 0x00  Red
         # 0xC0, 0xC0, 0xC0  Silver
         # 0xFF, 0xA5, 0x00  Orange
-        screenstyle.body.grad_color = lv.color_hex(0xffffff)
-        screenstyle.body.border.color = lv.color_hex(0xe32a19)
-        screenstyle.body.border.width = 5
-        screenstyle.text.color = lv.color_hex(0xa028d4)
+        # set background color, with no gradient
+        
+        # set background and text color based on dBA reading
+        if dba < 65:
+            bg_color = lv.color_hex(0x00FF00) # green
+            text_color = lv.color_hex(0x000000) # black
+        elif dba < 80:
+            bg_color = lv.color_hex(0xFFFF00) # yellow
+            text_color = lv.color_hex(0x000000) # black
+        else:
+            bg_color = lv.color_hex(0xFF0000)  # red
+            text_color = lv.color_hex(0xFFFFFF) # white
+            
+        screenstyle.body.grad_color = bg_color
+        screenstyle.body.main_color = bg_color
+        #screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        #screenstyle.body.border.width = 5
+        screenstyle.text.color = text_color
         screenstyle.text.font = lv.font_roboto_120
         decibel_screen.set_style(screenstyle)
         
         reading = lv.label(decibel_screen)
         reading.set_x(40)
         reading.set_y(70)
-        reading.set_text('{:.1f}'.format(repo.get('dba').current))
+        reading.set_text('{:.1f}'.format(dba))
         
         unit = lv.label(decibel_screen)
         unitstyle = lv.style_t(lv.style_plain)
-        unitstyle.text.color = lv.color_hex(0xa028d4)
+        unitstyle.text.color = text_color
         unitstyle.text.font = lv.font_roboto_28
         unit.set_style(lv.label.STYLE.MAIN, unitstyle)
         unit.set_x(215)
@@ -728,12 +741,14 @@ class MQTTPublish():
             loop.create_task(self.run_mqtt())
         finally:
             self.client.close()  # Prevent LmacRxBlk:1 errors  
-        
+    
     async def run_mqtt(self):
         await self.client.connect()
+        log.info('MQTT:turn WiFi off')
         self.client.pause()
         while True:
             await self.event_mqtt_publish
+            
             log.info('MQTT:turn WiFi on')
             self.wifi_status = 'on'
             self.client.resume()
@@ -752,6 +767,7 @@ class MQTTPublish():
             log.info('MQTT:turn WiFi off')
             self.wifi_status = 'off'
             self.client.pause()
+            
             self.event_mqtt_publish.clear()
             
             # TODO need a better place to perform measurement stat clearing (another event sync object?)
@@ -767,6 +783,7 @@ class MQTTPublish():
             repo.clear_stats('dba')
             repo.clear_stats('vusb')
             repo.clear_stats('vbat')
+            await asyncio.sleep(0)
             
 class Microphone():
     def __init__(self):
@@ -926,6 +943,7 @@ class VoltageMonitor():
             
             v_bat_sample_sum = 0
             v_usb_sample_sum = 0
+            await asyncio.sleep(0)
 #
 #  TODO add User Interface, likely using setup screens driven by buttons
 #
