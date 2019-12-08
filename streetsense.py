@@ -363,7 +363,7 @@ class Display():
         self.screen_timeout = False
         self.timeout_timer = Timer(-1)
         self.backlight_ctrl = Pin(2, Pin.OUT)
-        self.backlight_ctrl.value(1)
+        self.backlight_ctrl.value(0)
         loop = asyncio.get_event_loop()
         loop.create_task(self.run_display()) 
         
@@ -377,9 +377,12 @@ class Display():
         # SPI bus init was taken out of LittlevGL for streetsense design...should fix this.  TODO
         # SPI bus initialization is done when the SD Card is initialized 
         # (must be called before display initialization) 
+        
+        # TODO - tweak display init so rst and backlight args are optional
         disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, rst=15, backlight=2, mhz=25)
         disp.init()
-        
+        self.backlight_ctrl.value(0)  # note: init() turns on backlight
+
         # Register display driver to LittlevGL
         # ... Start boilerplate magic
         disp_buf1 = lv.disp_buf_t()
@@ -445,6 +448,7 @@ class Display():
         img.set_src(img_dsc)
         
         lv.scr_load(welcome_screen1)
+        self.backlight_ctrl.value(1)
         await asyncio.sleep(2)
         #
         # show GVCC image 
@@ -469,7 +473,7 @@ class Display():
         img.set_src(img_dsc)
         lv.scr_load(welcome_screen2)
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         #
         # show GV Placemaking image 
         #
@@ -491,7 +495,7 @@ class Display():
         
         img.set_src(img_dsc)
         lv.scr_load(welcome_screen3)   
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         
     async def show_measurement_screen(self):
         # 
@@ -962,6 +966,8 @@ pms5003.set_debug(False)
 asyncio.set_debug(False)
 asyncio.core.set_debug(False)
 MQTTClient.DEBUG = False
+
+log.info('Reset Cause = %d', machine.reset_cause())
 
 i2c = I2C(scl=Pin(26), sda=Pin(27))
 ds3231 = urtc.DS3231(i2c, address=0x68)
