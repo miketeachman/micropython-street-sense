@@ -118,7 +118,7 @@ LOGGING_INTERVAL_IN_SECS = 60*2
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 30
+RECORD_TIME_IN_SECONDS = 60*5
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -127,7 +127,13 @@ NUM_BYTES_IN_SAMPLE_BLOCK = NUM_BYTES_IN_SDCARD_SECTOR * (NUM_BYTES_RX // NUM_BY
 NUM_SAMPLE_BYTES_IN_WAV = (RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_USED)
 NUM_SAMPLE_BYTES_TO_RX = ((RECORD_TIME_IN_SECONDS * SAMPLES_PER_SECOND * NUM_BYTES_RX))
 
-PM25_POLLING_DELAY_MS = 500
+DEMO_MODE = 1
+NORMAL_MODE = 2
+Mode = namedtuple('Mode', 'aq display logging mqtt')
+modes = {DEMO_MODE:Mode(aq='continuous', display='always_on', logging=0, mqtt=0),
+         NORMAL_MODE:Mode(aq='periodic', display="timeout", logging=1, mqtt=1)}
+
+PM_POLLING_DELAY_MS = 500
 
 # convert a timestamp (in seconds) from MicroPython epoch to Unix epoch
 # from uPy docs:  "However, embedded ports use epoch of 2000-01-01 00:00:00 UTC"
@@ -245,6 +251,7 @@ class SpecSensors():
         repo.add('no2_vref', await self.read(ADS1219.CHANNEL_AIN3))      
         
         # calculate gas concentration in parts-per-billion (ppb)
+        # TODO investigate differential ADC calc
         # TODO calibrate Spec Sensors, with offset
         ozone_ppb = (repo.get('o3_vgas').current - repo.get('o3_vref').current) / self.CALIBRATION_FACTOR_OZONE
         repo.add('o3', ozone_ppb)
@@ -255,6 +262,14 @@ class SpecSensors():
 class THSensor():
     def __init__(self):
         log.info('TH:init')
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.run_th_continuous())
+        
+    async def run_th_continuous(self):
+        while True:
+            repo.add('tdegc', temp_humid_sensor.temperature)
+            repo.add('rh', temp_humid_sensor.relative_humidity)
+            await asyncio.sleep(1)
 
     async def read(self):
         repo.add('tdegc', temp_humid_sensor.temperature)
@@ -263,40 +278,71 @@ class THSensor():
 class ParticulateSensor():
     def __init__(self, 
                  lock, 
-                 event_new_pm25_data):
+                 event_new_pm_data):
         log.info('PM:init')
         self.lock = lock
-        self.event_new_pm25_data = event_new_pm25_data
-        self.pm25_pwr_pin = Pin(25, Pin.OUT)
-        self.pm25_pwr_pin.value(0)
+        self.event_new_pm_data = event_new_pm_data
+        self.uart = None
+        self.pm = None
+        self.pm_pwr_pin = Pin(25, Pin.OUT)
+        if modes[operating_mode].aq == 'continuous':
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.run_pm_continuous())
+        else:
+            self.pm_pwr_pin.value(0)
         
-    async def read_pm25(self):
+    async def read_pm(self):
         log.info('PM:30s warm-up')
-        self.pm25_pwr_pin.value(1)
+        self.pm_pwr_pin.value(1)
         await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
         self.uart = UART(1, tx=32, rx=33, baudrate=9600)
-        self.pm25 = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm25_data)
+        self.pm = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm_data)
         await asyncio.sleep(1)
         log.debug('PM:set Passive mode')
-        await self.pm25.setPassiveMode()
+        await self.pm.setPassiveMode()
         log.debug('PM:trigger read sensor')
         await asyncio.sleep(1)
-        await self.pm25.read()
+        await self.pm.read()
         log.debug('PM:waiting for event')
-        await self.event_new_pm25_data
+        await self.event_new_pm_data
         log.debug('PM:got event')
-        repo.add('pm25', await ps.get_value())
+        repo.add('pm10', self.pm.pm10_env)
+        repo.add('pm25', self.pm.pm25_env)
+        repo.add('pm100', self.pm.pm100_env)
         log.info('PM:PM2.5 = %d', repo.get('pm25').current)
-        self.event_new_pm25_data.clear() 
+        self.event_new_pm_data.clear() 
         Pin(32, Pin.IN, Pin.PULL_DOWN)
         Pin(33, Pin.IN, Pin.PULL_DOWN)
         log.info('PM:power-down')
-        self.pm25_pwr_pin.value(0)
+        self.pm_pwr_pin.value(0)
         
+    async def run_pm_continuous(self):
+        log.info('PM:30s warm-up')
+        self.pm_pwr_pin.value(1)
+        await asyncio.sleep(30) # 30s warm-up period as specified in datasheet
+        self.uart = UART(1, tx=32, rx=33, baudrate=9600)
+        self.pm = pms5003.PMS5003(self.uart, self.lock, event = self.event_new_pm_data)
+        while True:
+            await asyncio.sleep(1)
+            log.debug('PM:set Passive mode')
+            await self.pm.setPassiveMode()
+            log.debug('PM:trigger read sensor')
+            await asyncio.sleep(1)
+            await self.pm.read()
+            log.debug('PM:waiting for event')
+            await self.event_new_pm_data
+            log.debug('PM:got event')
+            repo.add('pm10', self.pm.pm10_env)
+            repo.add('pm25', self.pm.pm25_env)
+            repo.add('pm100', self.pm.pm100_env)
+            log.debug('PM:PM2.5 = %d', repo.get('pm25').current)
+            self.event_new_pm_data.clear() 
+            await asyncio.sleep(0)
+    '''    
     # TODO method needed anymore ?    
     async def get_value(self):
-        return self.pm25.pm25_env
-
+        return self.pm.pm25_env
+    '''
 class IntervalTimer():
     def __init__(self, event_mqtt_publish):  
         log.info('TMR:init')
@@ -334,11 +380,12 @@ class IntervalTimer():
             # dispatch a whole pile of activity
             # following sequence is deliberately sequential so PM2.5 sensor is powered off when
             # the Spec Sensor devices are being read
-            await ps.read_pm25()
+            await ps.read_pm()
             await spec_sensors.read_all()
             await temp_hum.read()
             await sdcard_logger.run_logger()
-            self.event_mqtt_publish.set()
+            if modes[operating_mode].mqtt == 1:
+                self.event_mqtt_publish.set()
             mem_free_before_gc = gc.mem_free()
             log.debug('TMR:gc mem_free = %d bytes', mem_free_before_gc)
             gc.collect()
@@ -352,6 +399,7 @@ class Display():
         log.info('DISP:init')
         self.screens = [self.show_measurement_screen, 
                         self.show_decibel_screen, 
+                        self.show_environmental_screen,                        
                         self.show_voltage_monitor_screen,
                         self.show_display_sleep_screen]
         pin_screen = Pin(0, Pin.IN, Pin.PULL_UP)
@@ -407,12 +455,13 @@ class Display():
             if (self.next_screen != self.active_screen):
                 self.active_screen = self.next_screen
                 self.screen_timeout = False
-                self.timeout_timer.init(period=Display.SCREEN_TIMEOUT_IN_S * 1000, 
-                                        mode=Timer.ONE_SHOT, 
-                                        callback=self.screen_timeout_callback)
+                if modes[operating_mode].display == 'timeout':
+                    self.timeout_timer.init(period=Display.SCREEN_TIMEOUT_IN_S * 1000, 
+                                            mode=Timer.ONE_SHOT, 
+                                            callback=self.screen_timeout_callback)
                 
             elif (self.screen_timeout == True):
-                self.next_screen = 3  # TODO ugly. see above comment re:  datastructure for screens
+                self.next_screen = len(self.screens) - 1
             
             # display the active screen    
             await self.screens[self.active_screen]()
@@ -534,34 +583,96 @@ class Display():
         mtable = lv.table(measurement_screen)
         mtable.set_row_cnt(6)
         mtable.set_col_cnt(3)
-        mtable.set_col_width(0, 110)
-        mtable.set_col_width(1, 100)
+        mtable.set_col_width(0, 120)
+        mtable.set_col_width(1, 90)
         mtable.set_col_width(2, 100)
         mtable.set_style(lv.table.STYLE.BG, tablestyle)
         mtable.set_style(lv.table.STYLE.CELL1, cellstyle)
         
-        mtable.set_cell_value(0,0, "NO2")
-        mtable.set_cell_value(1,0, "O3")
+        mtable.set_cell_value(0,0, "Noise")
+        mtable.set_cell_value(1,0, "PM1.0")
         mtable.set_cell_value(2,0, "PM2.5")
-        mtable.set_cell_value(3,0, "Temp")
-        mtable.set_cell_value(4,0, "RH")
-        mtable.set_cell_value(5,0, "Noise")
+        mtable.set_cell_value(3,0, "PM10.0")
+        mtable.set_cell_value(4,0, "NO2")
+        mtable.set_cell_value(5,0, "O3")
         
-        mtable.set_cell_value(0,2, "ppb")
-        mtable.set_cell_value(1,2, "ppb")
+        mtable.set_cell_value(0,1, '{:.1f}'.format(repo.get('dba').current))
+        mtable.set_cell_value(1,1, '{}'.format(repo.get('pm10').current))
+        mtable.set_cell_value(2,1, '{}'.format(repo.get('pm25').current))
+        mtable.set_cell_value(3,1, '{}'.format(repo.get('pm100').current))
+        
+        if repo.get('no2').current == 0:
+            mtable.set_cell_value(4,1, 'N/A')
+        else:
+            mtable.set_cell_value(4,1, '{:.1f}'.format(repo.get('no2').current))
+        if repo.get('o3').current == 0:
+            mtable.set_cell_value(5,1, 'N/A')
+        else:
+            mtable.set_cell_value(5,1, '{:.1f}'.format(repo.get('o3').current))
+        
+        mtable.set_cell_value(0,2, "dB(A)")
+        mtable.set_cell_value(1,2, "ug/m3")
         mtable.set_cell_value(2,2, "ug/m3")
-        mtable.set_cell_value(3,2, "degC")
-        mtable.set_cell_value(4,2, "%")
-        mtable.set_cell_value(5,2, "dB(A)")
+        mtable.set_cell_value(3,2, "ug/m3")
+        mtable.set_cell_value(4,2, "ppb")
+        mtable.set_cell_value(5,2, "ppb")
         
-        mtable.set_cell_value(0,1, '{:.1f}'.format(repo.get('no2').current))
-        mtable.set_cell_value(1,1, '{:.1f}'.format(repo.get('o3').current))
-        mtable.set_cell_value(2,1, '{:.1f}'.format(repo.get('pm25').current))
-        mtable.set_cell_value(3,1, '{:.1f}'.format(repo.get('tdegc').current))
-        mtable.set_cell_value(4,1, '{:.1f}'.format(repo.get('rh').current))
-        mtable.set_cell_value(5,1, '{:.1f}'.format(repo.get('dba').current))
-
         lv.scr_load(measurement_screen)
+        self.backlight_ctrl.value(1)
+
+    async def show_environmental_screen(self):
+        # 
+        # Environmental screen using a table
+        #
+        #
+        # lv.table.STYLE.CELL1 = normal cell
+        # lv.table.STYLE.CELL2 = header cell
+        # lv.table.STYLE.CELL3 = ?
+        # lv.table.STYLE.CELL4 = ?
+        environmental_screen = lv.obj()
+        
+        # set background color, with no gradient
+        screenstyle = lv.style_t(lv.style_plain)
+        #screenstyle.body.main_color = lv.color_make(0xFF, 0xA5, 0x00)
+        # 0xFF, 0x00, 0x00  Red
+        # 0xC0, 0xC0, 0xC0  Silver
+        # 0xFF, 0xA5, 0x00  Orange
+        #screenstyle.body.grad_color = lv.color_make(0xFF, 0xA5, 0x00)
+        #screenstyle.body.border.color = lv.color_hex(0xe32a19)
+        #screenstyle.body.border.width = 5
+        environmental_screen.set_style(screenstyle)
+        
+        tablestyle = lv.style_t(lv.style_plain)
+        tablestyle.body.border.width = 0
+        tablestyle.body.opa = 0
+        
+        cellstyle = lv.style_t(lv.style_plain)
+        cellstyle.text.color = lv.color_hex(0xa028d4)
+        cellstyle.text.font = lv.font_roboto_28
+        cellstyle.body.padding.top = 1
+        cellstyle.body.padding.bottom = 1
+        cellstyle.body.border.width = 0
+        cellstyle.body.opa = 0
+        
+        mtable = lv.table(environmental_screen)
+        mtable.set_row_cnt(2)
+        mtable.set_col_cnt(3)
+        mtable.set_col_width(0, 130)
+        mtable.set_col_width(1, 90)
+        mtable.set_col_width(2, 90)
+        mtable.set_style(lv.table.STYLE.BG, tablestyle)
+        mtable.set_style(lv.table.STYLE.CELL1, cellstyle)
+        
+        mtable.set_cell_value(0,0, "Temp")
+        mtable.set_cell_value(1,0, "Humidity")
+        
+        mtable.set_cell_value(0,1, '{:.1f}'.format(repo.get('tdegc').current))
+        mtable.set_cell_value(1,1, '{:.1f}'.format(repo.get('rh').current))
+        
+        mtable.set_cell_value(0,2, "degC")
+        mtable.set_cell_value(1,2, "%")
+        
+        lv.scr_load(environmental_screen)
         self.backlight_ctrl.value(1)
 
     async def show_voltage_monitor_screen(self): 
@@ -607,8 +718,8 @@ class Display():
         mtable.set_style(lv.table.STYLE.BG, tablestyle)
         mtable.set_style(lv.table.STYLE.CELL1, cellstyle)
         
-        mtable.set_cell_value(0,0, "V_BAT")
-        mtable.set_cell_value(1,0, "V_USB")
+        mtable.set_cell_value(0,0, "Vbat")
+        mtable.set_cell_value(1,0, "Vusb")
         
         mtable.set_cell_value(0,2, "V")
         mtable.set_cell_value(1,2, "V")
@@ -636,10 +747,10 @@ class Display():
         # set background color, with no gradient
         
         # set background and text color based on dBA reading
-        if dba < 65:
+        if dba < 70:
             bg_color = lv.color_hex(0x00FF00) # green
             text_color = lv.color_hex(0x000000) # black
-        elif dba < 80:
+        elif dba < 85:
             bg_color = lv.color_hex(0xFFFF00) # yellow
             text_color = lv.color_hex(0x000000) # black
         else:
@@ -967,6 +1078,8 @@ asyncio.set_debug(False)
 asyncio.core.set_debug(False)
 MQTTClient.DEBUG = False
 
+operating_mode = DEMO_MODE
+
 log.info('Reset Cause = %d', machine.reset_cause())
 
 i2c = I2C(scl=Pin(26), sda=Pin(27))
@@ -995,16 +1108,24 @@ while True:
         
 loop = asyncio.get_event_loop(ioq_len=2)
 lock = asyn.Lock()
-event_new_pm25_data = asyn.Event(PM25_POLLING_DELAY_MS)
+event_new_pm_data = asyn.Event(PM_POLLING_DELAY_MS)
 event_mqtt_publish = asyn.Event()
 
 spec_sensors = SpecSensors()
 temp_hum = THSensor()
-ps = ParticulateSensor(lock, event_new_pm25_data)
+ps = ParticulateSensor(lock, event_new_pm_data)
 display = Display()
-interval_timer = IntervalTimer(event_mqtt_publish)
-sdcard_logger = SDCardLogger()
+
+if modes[operating_mode].aq == 'periodic':
+    interval_timer = IntervalTimer(event_mqtt_publish)
+
+if modes[operating_mode].logging == 1:
+    sdcard_logger = SDCardLogger()
+    
 mic = Microphone()
-mqtt = MQTTPublish(event_mqtt_publish)
+
+if modes[operating_mode].mqtt == 1:
+    mqtt = MQTTPublish(event_mqtt_publish)
+    
 voltage_monitor = VoltageMonitor()
 loop.run_forever()
