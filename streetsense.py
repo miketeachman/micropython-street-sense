@@ -113,12 +113,12 @@ from collections import namedtuple
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*2
+LOGGING_INTERVAL_IN_SECS = 60*15
 
 #  TODO clean this up...confusing, complicated
 # I2S Microphone related config
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*5
+RECORD_TIME_IN_SECONDS = 60*60*6
 NUM_BYTES_RX = 8
 NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
@@ -393,7 +393,7 @@ class IntervalTimer():
 
 class Display():
     SCREEN_TIMEOUT_IN_S = 60*5
-    SCREEN_REFRESH_IN_S = 1  # TODO idea:  each screen might have a configurable update time
+    SCREEN_REFRESH_IN_S = 1
     
     def __init__(self):
         log.info('DISP:init')
@@ -600,15 +600,8 @@ class Display():
         mtable.set_cell_value(1,1, '{}'.format(repo.get('pm10').current))
         mtable.set_cell_value(2,1, '{}'.format(repo.get('pm25').current))
         mtable.set_cell_value(3,1, '{}'.format(repo.get('pm100').current))
-        
-        if repo.get('no2').current == 0:
-            mtable.set_cell_value(4,1, 'N/A')
-        else:
-            mtable.set_cell_value(4,1, '{:.1f}'.format(repo.get('no2').current))
-        if repo.get('o3').current == 0:
-            mtable.set_cell_value(5,1, 'N/A')
-        else:
-            mtable.set_cell_value(5,1, '{:.1f}'.format(repo.get('o3').current))
+        mtable.set_cell_value(4,1, '{:.1f}'.format(repo.get('no2').current))
+        mtable.set_cell_value(5,1, '{:.1f}'.format(repo.get('o3').current))
         
         mtable.set_cell_value(0,2, "dB(A)")
         mtable.set_cell_value(1,2, "ug/m3")
@@ -1078,7 +1071,7 @@ asyncio.set_debug(False)
 asyncio.core.set_debug(False)
 MQTTClient.DEBUG = False
 
-operating_mode = DEMO_MODE
+operating_mode = NORMAL_MODE
 
 log.info('Reset Cause = %d', machine.reset_cause())
 
@@ -1105,27 +1098,43 @@ while True:
         break
     except:
         utime.sleep_ms(100)
+
+# create file exception.txt if it does not yet exist
+files = uos.listdir("/sd")
+if not 'exception.txt' in files:
+    f = open('/sd/exception.txt', mode='wt', encoding='utf-8')
+    f.close()
+
+# wrap the application in a global exception catcher
+try:
+    loop = asyncio.get_event_loop(ioq_len=2)
+    lock = asyn.Lock()
+    event_new_pm_data = asyn.Event(PM_POLLING_DELAY_MS)
+    event_mqtt_publish = asyn.Event()
+    
+    spec_sensors = SpecSensors()
+    temp_hum = THSensor()
+    ps = ParticulateSensor(lock, event_new_pm_data)
+    display = Display()
+    
+    if modes[operating_mode].aq == 'periodic':
+        interval_timer = IntervalTimer(event_mqtt_publish)
+    
+    if modes[operating_mode].logging == 1:
+        sdcard_logger = SDCardLogger()
         
-loop = asyncio.get_event_loop(ioq_len=2)
-lock = asyn.Lock()
-event_new_pm_data = asyn.Event(PM_POLLING_DELAY_MS)
-event_mqtt_publish = asyn.Event()
-
-spec_sensors = SpecSensors()
-temp_hum = THSensor()
-ps = ParticulateSensor(lock, event_new_pm_data)
-display = Display()
-
-if modes[operating_mode].aq == 'periodic':
-    interval_timer = IntervalTimer(event_mqtt_publish)
-
-if modes[operating_mode].logging == 1:
-    sdcard_logger = SDCardLogger()
+    mic = Microphone()
     
-mic = Microphone()
-
-if modes[operating_mode].mqtt == 1:
-    mqtt = MQTTPublish(event_mqtt_publish)
-    
-voltage_monitor = VoltageMonitor()
-loop.run_forever()
+    if modes[operating_mode].mqtt == 1:
+        mqtt = MQTTPublish(event_mqtt_publish)
+        
+    voltage_monitor = VoltageMonitor()
+    loop.run_forever()
+except Exception as e:
+    # "should" never get here.  
+    # Save exception to a file and force a hard reset
+    emsg = 'Unexpected Exception {} {}\n'.format(type(e).__name__, e)
+    print(emsg)
+    with open('/sd/exception.txt', mode='at', encoding='utf-8') as f:
+        f.write(emsg)
+    machine.reset()
