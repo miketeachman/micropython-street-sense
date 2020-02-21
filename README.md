@@ -39,11 +39,11 @@ which includes these customizations:
 |urtc:    | https://github.com/adafruit/Adafruit-uRTC      |
 |ads1219: | https://github.com/miketeachman/micropython-ads1219|
 |si7021:  | https://github.com/chrisbalmer/micropython-si7021|
-|mqtt\_as:|  https://github.com/peterhinch/micropython-async/blob/master/fast_io/ms_timer.py|
+|mqtt\_as:| https://github.com/kevinkk525/micropython-mqtt/tree/pause_resume|
 |logging: | https://github.com/micropython/micropython-lib/tree/master/logging|
 
 
 ### MicroPython Libs
-fork of littlevgl with customizations
+fork of littlevgl graphics library with customizations
 https://github.com/miketeachman/lv_binding_micropython/commits/lvgl-streetsense
  

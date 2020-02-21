@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# Copyright (c) 2019 Mike Teachman
+# Copyright (c) 2020 Mike Teachman
 # https://opensource.org/licenses/MIT
 
 #
@@ -24,8 +24,8 @@ import utime
 from mqtt_as import MQTTClient
 from mqtt_config import mqtt_config
 import uasyncio as asyncio
-import asyn
 from aswitch import Pushbutton
+import asyn
 import ms_timer
 import logging
 from ads1219 import ADS1219
@@ -113,14 +113,14 @@ from collections import namedtuple
 #    5
 #    36
 
-LOGGING_INTERVAL_IN_SECS = 60*15
+LOGGING_INTERVAL_IN_SECS = 60*2
 
-#  TODO clean this up...confusing, complicated
 # I2S Microphone related config
+# TODO:  refactor this section to improve reader comprehension
 SAMPLES_PER_SECOND = 10000
-RECORD_TIME_IN_SECONDS = 60*60*6
+RECORD_TIME_IN_SECONDS = 20
 NUM_BYTES_RX = 8
-NUM_BYTES_USED = 2  # this one is especially bad  TODO:  refactor
+NUM_BYTES_USED = 2  
 BITS_PER_SAMPLE = NUM_BYTES_USED * 8
 NUM_BYTES_IN_SDCARD_SECTOR = 512
 NUM_BYTES_IN_SAMPLE_BLOCK = NUM_BYTES_IN_SDCARD_SECTOR * (NUM_BYTES_RX // NUM_BYTES_USED)
@@ -426,15 +426,15 @@ class Display():
         # SPI bus initialization is done when the SD Card is initialized 
         # (must be called before display initialization) 
         
-        # TODO - tweak display init so rst and backlight args are optional
-        disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, rst=15, backlight=2, mhz=25)
+        disp = ili.display(spihost=1, miso=19, mosi=23, clk=18, cs=22, dc=21, mhz=25, share=ili.SHARED)
         disp.init()
+        
         self.backlight_ctrl.value(0)  # note: init() turns on backlight
 
         # Register display driver to LittlevGL
         # ... Start boilerplate magic
         disp_buf1 = lv.disp_buf_t()
-        buf1_1 = bytearray(480*10)
+        buf1_1 = bytearray(320*10)
         lv.disp_buf_init(disp_buf1,buf1_1, None, len(buf1_1)//4)
         disp_drv = lv.disp_drv_t()
         lv.disp_drv_init(disp_drv)
